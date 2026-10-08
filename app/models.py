@@ -40,7 +40,10 @@ class Mod(Base):
 
     releases: Mapped[list["ModRelease"]] = relationship(back_populates="mod", cascade="all, delete-orphan")
     sources: Mapped[list["DiscordSource"]] = relationship(back_populates="mod", cascade="all, delete-orphan")
-    addons: Mapped[list["Addon"]] = relationship(back_populates="mod", cascade="all, delete-orphan")
+    addons: Mapped[list["Addon"]] = relationship(back_populates="mod", foreign_keys="Addon.mod_id", cascade="all, delete-orphan")
+    parent_mod_id: Mapped[int | None] = mapped_column(ForeignKey("mods.id", ondelete="SET NULL"), index=True)
+    catalog_visible: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    origin: Mapped[str] = mapped_column(String(30), default="discord", index=True)
 
 
 class ModRelease(Base):
@@ -70,7 +73,9 @@ class Addon(Base):
     discord_message_id: Mapped[int | None] = mapped_column(Integer)
     discord_thread_id: Mapped[int | None] = mapped_column(Integer)
     source_hash: Mapped[str | None] = mapped_column(String(128))
-    mod: Mapped["Mod"] = relationship(back_populates="addons")
+    addon_mod_id: Mapped[int | None] = mapped_column(ForeignKey("mods.id", ondelete="SET NULL"), index=True)
+    mod: Mapped["Mod"] = relationship(back_populates="addons", foreign_keys=[mod_id])
+    addon_mod: Mapped["Mod | None"] = relationship(foreign_keys=[addon_mod_id])
 
 
 class Dependency(Base):
@@ -82,6 +87,8 @@ class Dependency(Base):
     target_name: Mapped[str | None] = mapped_column(String(300))
     target_url: Mapped[str | None] = mapped_column(Text)
     relation_type: Mapped[str] = mapped_column(String(40))
+    required_version: Mapped[str | None] = mapped_column(String(120))
+    source_kind: Mapped[str] = mapped_column(String(30), default="html")
     raw_phrase: Mapped[str | None] = mapped_column(String(200))
     evidence: Mapped[str | None] = mapped_column(Text)
     confidence: Mapped[float] = mapped_column(default=0.5)
@@ -97,6 +104,7 @@ class Compatibility(Base):
     target_name: Mapped[str | None] = mapped_column(String(300))
     target_url: Mapped[str | None] = mapped_column(Text)
     relation_type: Mapped[str] = mapped_column(String(40))
+    source_kind: Mapped[str] = mapped_column(String(30), default="html")
     raw_phrase: Mapped[str | None] = mapped_column(String(200))
     evidence: Mapped[str | None] = mapped_column(Text)
     confidence: Mapped[float] = mapped_column(default=0.5)
@@ -144,6 +152,7 @@ class BuildMod(Base):
     mod_id: Mapped[int] = mapped_column(ForeignKey("mods.id", ondelete="RESTRICT"))
     release_id: Mapped[int | None] = mapped_column(ForeignKey("mod_releases.id", ondelete="SET NULL"))
     selected_version: Mapped[str | None] = mapped_column(String(120))
+    auto_added: Mapped[bool] = mapped_column(Boolean, default=False)
     position: Mapped[int] = mapped_column(Integer)
     build: Mapped["Build"] = relationship(back_populates="mods")
 
@@ -155,6 +164,9 @@ class CachedFile(Base):
     url: Mapped[str] = mapped_column(Text)
     path: Mapped[str] = mapped_column(Text)
     filename: Mapped[str] = mapped_column(String(500))
+    owner_mod_id: Mapped[int | None] = mapped_column(ForeignKey("mods.id", ondelete="SET NULL"), index=True)
+    owner_release_id: Mapped[int | None] = mapped_column(ForeignKey("mod_releases.id", ondelete="SET NULL"), index=True)
+    game_version: Mapped[str | None] = mapped_column(String(80), index=True)
     size_bytes: Mapped[int | None] = mapped_column(Integer)
     sha256: Mapped[str | None] = mapped_column(String(64))
     fetched_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)

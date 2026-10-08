@@ -19,7 +19,9 @@ class Settings(BaseSettings):
     download_concurrency: int = 4
     sqlite_busy_timeout_seconds: float = 30.0
     relation_min_confidence: float = 0.90
-    catalog_source_version: str = "9"
+    max_vintage_story_version: str = "1.22.7"
+    prefetch_concurrency: int = 2
+    catalog_source_version: str = "13"
 
     discord_token: str | None = None
     discord_guild_id: int | None = None

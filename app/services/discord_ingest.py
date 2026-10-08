@@ -193,8 +193,12 @@ class DiscordCatalogScanner:
         if not url:
             return None, None
         first = content.splitlines()[0].strip() if content.splitlines() else ""
-        title = re.sub(r"https?://\S+", "", first).strip(" -–—:[]()")
-        return (title or "Addon"), _clean_url(url)
+        # Forum replies are often written as Markdown headings, e.g. `## Realistic Rapids`
+        # followed by the Mod DB URL. Store the human title without Markdown decoration.
+        first = re.sub(r"^\s*#{1,6}\s*", "", first)
+        first = re.sub(r"https?://\S+", "", first)
+        first = first.strip(" -–—:[]()_*`~")
+        return (first or "Addon"), _clean_url(url)
 
 
 def _extract_moddb_url_from_message(message: discord.Message) -> tuple[str, str | None]:

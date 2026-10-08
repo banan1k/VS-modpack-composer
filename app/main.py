@@ -21,6 +21,8 @@ from .services.cache import CacheManager
 from .services.discord_ingest import DiscordCatalogScanner
 from .services.jobs import JobManager
 from .services.moddb import ModDBClient
+from .services.prefetch import PrefetchManager
+from .services.priority import PriorityCoordinator
 from .services.sync import CatalogSyncService
 
 settings.ensure_dirs()
@@ -77,7 +79,9 @@ cache = CacheManager(
     settings.http_timeout_seconds,
     settings.download_concurrency,
 )
-builds = BuildService(cache, moddb)
+priority = PriorityCoordinator()
+prefetch = PrefetchManager(cache, moddb, priority)
+builds = BuildService(cache, moddb, priority)
 
 
 class SyncResponse(BaseModel):
@@ -114,12 +118,15 @@ async def _start_discord():
 async def startup():
     global discord_task
     await init_db()
+    prefetch.start()
     if settings.discord_token:
         discord_task = asyncio.create_task(_start_discord())
 
 
 @app.on_event("shutdown")
 async def shutdown():
+    prefetch.stop()
+    await prefetch.wait_stopped()
     await moddb.close()
     await cache.close()
     if not bot.is_closed():
@@ -139,11 +146,26 @@ async def static_file(name: str):
     return FileResponse(file)
 
 
+@app.get("/api/prefetch/status")
+async def prefetch_status():
+    return await prefetch.status()
+
+
 @app.get("/api/catalog")
 async def catalog():
     async with SessionLocal() as session:
-        mods = (await session.execute(select(Mod).order_by(Mod.name))).scalars().all()
-        return [serialize_mod(m) for m in mods]
+        mods = (await session.execute(select(Mod).where(Mod.catalog_visible.is_(True)).order_by(Mod.name))).scalars().all()
+        mod_ids = [m.id for m in mods]
+        deps = (await session.execute(select(Dependency).where(Dependency.mod_id.in_(mod_ids)))).scalars().all() if mod_ids else []
+        threshold = settings.relation_min_confidence
+        required: dict[int, list[int]] = {}
+        for d in deps:
+            if d.relation_type == "dependency" and d.confidence >= threshold and d.target_mod_id:
+                required.setdefault(d.mod_id, []).append(d.target_mod_id)
+        return [
+            {**serialize_mod(m), "required_dependency_ids": required.get(m.id, [])}
+            for m in mods
+        ]
 
 
 @app.get("/api/mods/{mod_id}/relations")
@@ -159,6 +181,7 @@ async def relations(mod_id: int):
             await session.execute(select(Addon).where(Addon.mod_id == mod_id).order_by(Addon.id))
         ).scalars().all()
         target_ids = {x.target_mod_id for x in deps + comps if x.target_mod_id}
+        target_ids.update(a.addon_mod_id for a in addons if a.addon_mod_id)
         targets = {}
         if target_ids:
             targets = {
@@ -173,12 +196,15 @@ async def relations(mod_id: int):
             "addons": [
                 {
                     "relation_type": "addon",
-                    "target_name": a.title,
-                    "target_url": a.url,
+                    "target_mod_id": a.addon_mod_id,
+                    "target_name": targets.get(a.addon_mod_id).name if a.addon_mod_id and a.addon_mod_id in targets else a.title,
+                    "target_url": targets.get(a.addon_mod_id).mod_db_url if a.addon_mod_id and a.addon_mod_id in targets else a.url,
                     "confidence": 1.0,
                     "verified": True,
                     "evidence": "Discord thread",
                     "raw_phrase": "addon",
+                    "source_kind": "discord",
+                    "required_version": None,
                 }
                 for a in addons
             ],
@@ -201,8 +227,13 @@ async def sync_catalog():
             if job and job.kind == "catalog_sync":
                 return {"job_id": task_id}
     scanner = DiscordCatalogScanner(bot)
-    service = CatalogSyncService(scanner, moddb, cache)
-    job_id = await jobs.create("catalog_sync", service.run)
+    service = CatalogSyncService(scanner, moddb, cache, prefetch)
+
+    async def worker(job_id, jm):
+        async with priority.user_priority():
+            await service.run(job_id, jm)
+
+    job_id = await jobs.create("catalog_sync", worker)
     return {"job_id": job_id}
 
 
@@ -236,6 +267,8 @@ async def create_build(data: BuildCreate):
     return {
         "share_id": build.share_id,
         "name": build.name,
+        "mod_count": len(result.get("resolved_mod_ids", [])),
+        "auto_added_mod_ids": result.get("auto_added_mod_ids", []),
         "url": f"{settings.public_base_url.rstrip('/')}/build/{build.share_id}",
         "published": False,
     }
@@ -268,6 +301,7 @@ async def get_build(share_id: str):
                     "id": m.id,
                     "name": m.name,
                     "selected_version": bm.selected_version,
+                    "auto_added": bm.auto_added,
                     "image_url": m.image_url,
                     "mod_db_url": m.mod_db_url,
                 }
@@ -409,6 +443,10 @@ def _delete_temp_file(path: Path):
 
 
 def serialize_mod(m: Mod):
+    # Dependency IDs are sent with the catalog so the browser can expand a selection locally
+    # without making an extra request for every clicked card.
+    # This endpoint is called in the context of a loaded async session, so the relation query is
+    # intentionally performed in the route helper below instead of lazy-loading here.
     return {
         "id": m.id,
         "name": m.name,
@@ -428,6 +466,8 @@ def serialize_mod(m: Mod):
         "parse_status": m.parse_status,
         "parse_message": m.parse_message,
         "refreshed_at": m.refreshed_at.isoformat() if m.refreshed_at else None,
+        "parent_mod_id": m.parent_mod_id,
+        "origin": m.origin,
     }
 
 
@@ -442,4 +482,6 @@ def serialize_relation(r, targets):
         "verified": r.verified,
         "evidence": r.evidence,
         "raw_phrase": r.raw_phrase,
+        "source_kind": getattr(r, "source_kind", "html"),
+        "required_version": getattr(r, "required_version", None),
     }

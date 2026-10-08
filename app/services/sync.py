@@ -6,6 +6,7 @@ import io
 import json
 import logging
 from datetime import datetime, timezone
+from types import SimpleNamespace
 
 import discord
 from sqlalchemy import delete, select
@@ -17,16 +18,17 @@ from .cache import CacheManager
 from .discord_ingest import DiscordCatalogScanner, DiscordModRecord, DiscordScanResult
 from .moddb import ModDBClient, ModDBData
 from .parser import extract_api_relationships, extract_relationships, normalize_name
-from .versioning import latest_game_version
+from .versioning import latest_game_version, version_key
 
 logger = logging.getLogger(__name__)
 
 
 class CatalogSyncService:
-    def __init__(self, scanner: DiscordCatalogScanner, moddb: ModDBClient, cache: CacheManager | None = None):
+    def __init__(self, scanner: DiscordCatalogScanner, moddb: ModDBClient, cache: CacheManager | None = None, prefetch=None):
         self.scanner = scanner
         self.moddb = moddb
         self.cache = cache
+        self.prefetch = prefetch
         self._run_lock = asyncio.Lock()
 
     async def run(self, job_id, jobs):
@@ -47,7 +49,7 @@ class CatalogSyncService:
             total=max(scan.total_threads, 1),
             message=(
                 f"Discord: {scan.scanned_threads}/{scan.total_threads}; "
-                f"найдено модов: {len(records)}; ошибок: {len(errors)}"
+                f"найдено модов: {len(records)}; пропущено: {scan.skipped_no_mod_link}; ошибок: {len(errors)}"
             ),
         )
 
@@ -68,6 +70,8 @@ class CatalogSyncService:
                 if not mod:
                     mod = await self._find_existing_mod(session, source_url=rec.mod_db_url)
                 effective_source_hash = _source_fingerprint(rec.source_hash)
+                # A source changed, an algorithm changed, or this record has addon children whose
+                # metadata may not have been enriched yet.
                 if source and mod and source.source_hash == effective_source_hash:
                     unchanged += 1
                 else:
@@ -83,100 +87,91 @@ class CatalogSyncService:
             len(scan.errors),
         )
 
-        if scan.errors:
-            # Never reconcile/de-register old Discord sources after a partial scan.
-            logger.warning("[SYNC] Discord scan incomplete; stale sources will be kept")
-
         catalog_rows: list[dict] = []
-        if changed:
+        if records:
             try:
                 catalog_rows = await self.moddb.get_catalog_rows(force_refresh=True)
             except Exception as exc:  # noqa: BLE001
-                msg = f"Mod DB compact catalog unavailable: {type(exc).__name__}: {exc}"
-                errors.append(msg)
-                logger.exception("[SYNC] %s", msg)
+                errors.append(f"Mod DB compact catalog unavailable: {type(exc).__name__}: {exc}")
+                logger.exception("[SYNC] Mod DB compact catalog unavailable")
 
         sem = asyncio.Semaphore(max(1, settings.http_concurrency))
 
-        async def prepare(rec: DiscordModRecord, existing: Mod | None):
+        async def fetch_data(url: str, fallback_title: str) -> tuple[ModDBData, str | None]:
             async with sem:
                 api_error: Exception | None = None
                 page_error: Exception | None = None
-                data: ModDBData
-                html: str | None = None
-
                 try:
-                    data = await self.moddb.get_mod(
-                        _moddb_identifier(rec.mod_db_url),
-                        source_url=rec.mod_db_url,
-                        catalog_rows=catalog_rows,
-                    )
+                    data = await self.moddb.get_mod(_moddb_identifier(url), source_url=url, catalog_rows=catalog_rows)
                 except Exception as exc:  # noqa: BLE001
                     api_error = exc
                     data = ModDBData(
                         mod_db_id=None,
-                        asset_id=_asset_id_from_mod_url(rec.mod_db_url),
+                        asset_id=_asset_id_from_mod_url(url),
                         mod_id=None,
-                        name=rec.title or f"Mod {_asset_id_from_mod_url(rec.mod_db_url) or ''}".strip(),
+                        name=fallback_title or f"Mod {_asset_id_from_mod_url(url) or ''}".strip(),
                         description=None,
                         short_description=None,
                         image_url=None,
                         author=None,
                         mod_type=None,
-                        mod_db_url=rec.mod_db_url,
+                        mod_db_url=url,
                         releases=[],
                         source_updated_at=None,
                         raw_json=json.dumps({"fallback": True}, ensure_ascii=False),
                         notes=[f"Mod DB client: {type(exc).__name__}: {exc}"],
                     )
-                    logger.exception("[MODDB] client failed source=%s", rec.mod_db_url)
-
+                html = None
                 try:
-                    html = await self.moddb.get_page(rec.mod_db_url)
+                    html = await self.moddb.get_page(url)
                 except Exception as exc:  # noqa: BLE001
                     page_error = exc
-                    logger.warning(
-                        "[MODDB] page failed source=%s: %s: %s",
-                        rec.mod_db_url,
-                        type(exc).__name__,
-                        exc,
-                    )
-
+                    logger.warning("[MODDB] page failed source=%s: %s: %s", url, type(exc).__name__, exc)
                 if html:
                     data = self.moddb.enrich_from_page_html(data, html)
-
                 if api_error:
                     data.notes.append(f"API/summary error: {type(api_error).__name__}: {api_error}")
                 if page_error:
                     data.notes.append(f"HTML error: {type(page_error).__name__}: {page_error}")
+                return data, html
 
-                relations = []
-                if data.raw_json:
+        async def prepare(rec: DiscordModRecord, existing: Mod | None):
+            main_data, main_html = await fetch_data(rec.mod_db_url, rec.title)
+            relation_rows = []
+            try:
+                relation_rows.extend(extract_api_relationships(json.loads(main_data.raw_json)))
+            except Exception as exc:  # noqa: BLE001
+                main_data.notes.append(f"API relation parse error: {type(exc).__name__}: {exc}")
+            if main_html:
+                try:
+                    relation_rows.extend(extract_relationships(main_html, known_before))
+                except Exception as exc:  # noqa: BLE001
+                    main_data.notes.append(f"HTML relation parse error: {type(exc).__name__}: {exc}")
+                    logger.exception("[PARSER] relation parse failed source=%s", rec.mod_db_url)
+            relation_rows = _merge_relations(relation_rows)
+            image_path = await self._fetch_image(main_data)
+
+            addon_prepared = []
+            for addon in rec.addons:
+                try:
+                    addon_data, addon_html = await fetch_data(addon["url"], addon["title"])
+                    addon_relations = []
                     try:
-                        relations.extend(extract_api_relationships(json.loads(data.raw_json)))
+                        addon_relations.extend(extract_api_relationships(json.loads(addon_data.raw_json)))
                     except Exception as exc:  # noqa: BLE001
-                        data.notes.append(f"API relation parse error: {type(exc).__name__}: {exc}")
-                if html:
-                    try:
-                        relations.extend(extract_relationships(html, known_before))
-                    except Exception as exc:  # noqa: BLE001
-                        data.notes.append(f"HTML relation parse error: {type(exc).__name__}: {exc}")
-                        logger.exception("[PARSER] relation parse failed source=%s", rec.mod_db_url)
+                        addon_data.notes.append(f"API relation parse error: {type(exc).__name__}: {exc}")
+                    if addon_html:
+                        try:
+                            addon_relations.extend(extract_relationships(addon_html, known_before))
+                        except Exception as exc:  # noqa: BLE001
+                            addon_data.notes.append(f"HTML relation parse error: {type(exc).__name__}: {exc}")
+                    addon_relations = _merge_relations(addon_relations)
+                    addon_image = await self._fetch_image(addon_data)
+                    addon_prepared.append((addon, addon_data, addon_image, addon_relations))
+                except Exception as exc:  # noqa: BLE001
+                    logger.exception("[SYNC] addon enrichment failed parent=%s addon=%s", rec.title, addon.get("url"))
 
-                relations = _merge_relations(relations)
-
-                image_path = None
-                if self.cache and data.image_url:
-                    try:
-                        image_path = await self.cache.fetch_image(
-                            data.image_url,
-                            f"{data.mod_id or data.mod_db_id or data.asset_id or rec.thread_id}.img",
-                        )
-                    except Exception as exc:  # noqa: BLE001
-                        data.notes.append(f"Preview error: {type(exc).__name__}: {exc}")
-                        logger.warning("[MODDB] preview failed source=%s: %s", rec.mod_db_url, exc)
-
-                return rec, existing, data, image_path, relations
+            return rec, existing, main_data, image_path, relation_rows, addon_prepared
 
         saved = 0
         completed = 0
@@ -186,8 +181,8 @@ class CatalogSyncService:
             for task in asyncio.as_completed(tasks):
                 completed += 1
                 try:
-                    rec, existing, data, image_path, relations = await task
-                    await self._upsert_record(rec, data, image_path, relations, known_before, existing)
+                    rec, existing, data, image_path, relations, addon_prepared = await task
+                    await self._upsert_record(rec, data, image_path, relations, addon_prepared, existing)
                     saved += 1
                     logger.info(
                         "[SYNC] saved %s/%s source=%s name=%r modid=%r asset=%r api_id=%r status=%s",
@@ -207,7 +202,7 @@ class CatalogSyncService:
                 await jobs.update(
                     job_id,
                     current=completed,
-                    total=len(changed),
+                    total=max(len(changed), 1),
                     message=f"Mod DB: {completed}/{len(changed)}, сохранено {saved}, ошибок {len(errors) + len(save_errors)}",
                 )
 
@@ -233,6 +228,17 @@ class CatalogSyncService:
             message=final_message,
             errors=errors,
         )
+        if self.prefetch:
+            self.prefetch.trigger()
+
+    async def _fetch_image(self, data: ModDBData):
+        if self.cache and data.image_url:
+            try:
+                return await self.cache.fetch_image(data.image_url, f"{data.mod_id or data.mod_db_id or data.asset_id or 'mod'}.img")
+            except Exception as exc:  # noqa: BLE001
+                data.notes.append(f"Preview error: {type(exc).__name__}: {exc}")
+                logger.warning("[MODDB] preview failed source=%s: %s", data.mod_db_url, exc)
+        return None
 
     async def _load_known_mods(self):
         async with SessionLocal() as session:
@@ -255,25 +261,9 @@ class CatalogSyncService:
                 for m in mods
             ]
 
-    async def _upsert_record(
-        self,
-        rec: DiscordModRecord,
-        data: ModDBData,
-        image_path,
-        relations,
-        known_mods,
-        existing: Mod | None = None,
-    ):
+    async def _upsert_record(self, rec, data, image_path, relations, addon_prepared, existing=None):
         async with SessionLocal() as session:
-            # Re-resolve identity using the freshly fetched page/API data first. This repairs
-            # old rows that were created with the wrong API ID or wrong Mod DB page mapping.
-            mod = await self._find_existing_mod(
-                session,
-                source_url=rec.mod_db_url,
-                asset_id=data.asset_id,
-                mod_db_id=data.mod_db_id,
-                mod_id=data.mod_id,
-            )
+            mod = await self._find_existing_mod(session, source_url=rec.mod_db_url, asset_id=data.asset_id, mod_db_id=data.mod_db_id, mod_id=data.mod_id)
             if mod is None:
                 mod = existing
             if mod is None:
@@ -281,66 +271,9 @@ class CatalogSyncService:
                 session.add(mod)
                 await session.flush()
 
-            old_image_url = mod.image_url
-            mod.mod_db_id = data.mod_db_id
-            mod.mod_db_asset_id = data.asset_id
-            mod.mod_id = data.mod_id or mod.mod_id
-            mod.name = data.name or rec.title or mod.name
-            mod.description = data.description or mod.description
-            mod.short_description = data.short_description or mod.short_description or data.description
-            mod.image_url = data.image_url or mod.image_url
-            mod.image_cache_path = str(image_path) if image_path else mod.image_cache_path
-            mod.author = data.author or mod.author
-            mod.mod_type = data.mod_type or mod.mod_type
-            mod.mod_db_url = rec.mod_db_url or data.mod_db_url
-            mod.refreshed_at = datetime.now(timezone.utc)
-            mod.source_hash = hashlib.sha256(data.raw_json.encode()).hexdigest()
-            mod.source_updated_at = data.source_updated_at
-            mod.parse_status = "partial" if data.notes else "ok"
-            mod.parse_message = "\n".join(data.notes)[:8000] if data.notes else None
-
-            # No compiled build archive is persisted here. Image cache entries are keyed by URL,
-            # so a corrected image URL automatically receives a new file. The old file is harmless.
-            if old_image_url and data.image_url and old_image_url != data.image_url:
-                logger.info("[SYNC] preview URL changed for %s: %s -> %s", mod.name, old_image_url, data.image_url)
-
-            await session.execute(delete(ModRelease).where(ModRelease.mod_id == mod.id))
-            all_versions: set[str] = set()
-            latest_release = None
-            used_release_ids: set[int] = set()
-            for pos, raw in enumerate(data.releases):
-                tags = raw.get("tags") or raw.get("gameversions") or raw.get("game_versions") or []
-                tags = [str(x) for x in tags]
-                all_versions.update(tags)
-                release_id = _stable_release_id(raw, used_release_ids, pos)
-                used_release_ids.add(release_id)
-                session.add(
-                    ModRelease(
-                        mod_id=mod.id,
-                        release_id=release_id,
-                        mod_version=str(raw.get("modversion") or ""),
-                        filename=raw.get("filename"),
-                        file_id=_int_or_none(raw.get("fileid")),
-                        file_url=raw.get("mainfile") or raw.get("fileurl"),
-                        game_versions_json=json.dumps(tags),
-                        created_at=_parse_dt(raw.get("created")),
-                        changelog=raw.get("changelog"),
-                        raw_json=json.dumps(raw, ensure_ascii=False),
-                    )
-                )
-                candidate_key = (_version_key(str(raw.get("modversion") or "0")), str(raw.get("created", "")))
-                if latest_release is None or candidate_key > latest_release[0]:
-                    latest_release = (candidate_key, raw)
-
-            mod.latest_game_version = latest_game_version(sorted(all_versions))
-            if latest_release:
-                raw = latest_release[1]
-                mod.latest_release_id = int(raw.get("releaseid") or 0)
-                mod.latest_file_url = raw.get("mainfile") or raw.get("fileurl")
-                mod.latest_file_name = raw.get("filename")
-            mod.supported_versions_json = json.dumps(
-                sorted(all_versions, key=_version_key, reverse=True), ensure_ascii=False
-            )
+            self._apply_mod_data(mod, data, image_path, origin="discord", parent_mod_id=None, catalog_visible=True)
+            release_rows = await self._replace_releases(session, mod, data.releases)
+            self._recompute_latest(mod, release_rows)
 
             source = (
                 await session.execute(
@@ -375,74 +308,150 @@ class CatalogSyncService:
                 source.source_hash = _source_fingerprint(rec.source_hash)
                 source.scanned_at = datetime.now(timezone.utc)
 
-            # Add-ons belong to a Discord thread. Do not erase add-ons found in another source thread
-            # for the same mod.
-            await session.execute(
-                delete(Addon).where(
-                    Addon.mod_id == mod.id,
-                    Addon.discord_thread_id == rec.thread_id,
+            await session.execute(delete(Addon).where(Addon.mod_id == mod.id, Addon.discord_thread_id == rec.thread_id))
+            for addon, addon_data, addon_image, addon_relations in addon_prepared:
+                child = await self._find_existing_mod(
+                    session,
+                    source_url=addon_data.mod_db_url or addon["url"],
+                    asset_id=addon_data.asset_id,
+                    mod_db_id=addon_data.mod_db_id,
+                    mod_id=addon_data.mod_id,
                 )
-            )
-            for addon in rec.addons:
-                session.add(
-                    Addon(
-                        mod_id=mod.id,
-                        title=addon["title"],
-                        url=addon["url"],
-                        discord_message_id=addon["message_id"],
-                        discord_thread_id=rec.thread_id,
-                        source_hash=_source_fingerprint(rec.source_hash),
-                    )
-                )
+                if child is None:
+                    child = Mod(name=addon_data.name or addon["title"] or "Addon")
+                    session.add(child)
+                    await session.flush()
+                self._apply_mod_data(child, addon_data, addon_image, origin="addon", parent_mod_id=mod.id, catalog_visible=True)
+                child_release_rows = await self._replace_releases(session, child, addon_data.releases)
+                self._recompute_latest(child, child_release_rows)
+                session.add(Addon(
+                    mod_id=mod.id,
+                    title=addon_data.name or addon["title"],
+                    url=addon["url"],
+                    discord_message_id=addon.get("message_id"),
+                    discord_thread_id=rec.thread_id,
+                    source_hash=_source_fingerprint(rec.source_hash),
+                    addon_mod_id=child.id,
+                ))
+                await self._replace_relations_for_mod(session, child, addon_relations)
 
-            await session.execute(delete(Dependency).where(Dependency.mod_id == mod.id))
-            await session.execute(delete(Compatibility).where(Compatibility.mod_id == mod.id))
-
-            # Exact current DB indexes. Relation targets are also resolved in a final pass after all
-            # changed mods have been saved, so links to mods processed later are safe.
-            mods = (await session.execute(select(Mod))).scalars().all()
-            name_index = {normalize_name(m.name): m.id for m in mods if m.name}
-            id_index = {normalize_name(m.mod_id): m.id for m in mods if m.mod_id}
-            url_index = {str(m.mod_db_url).rstrip("/").casefold(): m.id for m in mods if m.mod_db_url}
-            asset_index = {m.mod_db_asset_id: m.id for m in mods if m.mod_db_asset_id is not None}
-            dbid_index = {m.mod_db_id: m.id for m in mods if m.mod_db_id is not None}
-            url_index[str(rec.mod_db_url).rstrip("/").casefold()] = mod.id
-            if mod.mod_db_asset_id is not None:
-                asset_index[mod.mod_db_asset_id] = mod.id
-            if mod.mod_db_id is not None:
-                dbid_index[mod.mod_db_id] = mod.id
-            if mod.mod_id:
-                id_index[normalize_name(mod.mod_id)] = mod.id
-            if mod.name:
-                name_index[normalize_name(mod.name)] = mod.id
-
-            for relation in relations:
-                target_id = None
-                if relation.url:
-                    clean = relation.url.rstrip("/").casefold()
-                    target_id = url_index.get(clean)
-                    if target_id is None:
-                        asset_id = _asset_id_from_mod_url(relation.url)
-                        if asset_id is not None:
-                            target_id = asset_index.get(asset_id)
-                if target_id is None and relation.target_name:
-                    target_key = normalize_name(relation.target_name)
-                    target_id = name_index.get(target_key) or id_index.get(target_key)
-                model = Compatibility if relation.relation_type in {"compatible", "incompatible"} else Dependency
-                session.add(
-                    model(
-                        mod_id=mod.id,
-                        target_mod_id=target_id,
-                        target_name=relation.target_name,
-                        target_url=relation.url,
-                        relation_type=relation.relation_type,
-                        raw_phrase=relation.raw_phrase,
-                        evidence=relation.evidence,
-                        confidence=relation.confidence,
-                        verified=False,
-                    )
-                )
+            await self._replace_relations_for_mod(session, mod, relations)
             await session.commit()
+
+    def _apply_mod_data(self, mod: Mod, data: ModDBData, image_path, *, origin: str, parent_mod_id: int | None, catalog_visible: bool):
+        old_page = mod.mod_db_url
+        if data.mod_db_id is not None:
+            mod.mod_db_id = data.mod_db_id
+        if data.asset_id is not None:
+            mod.mod_db_asset_id = data.asset_id
+        if data.mod_id:
+            mod.mod_id = data.mod_id
+        if data.name and not _bad_generated_name(data.name):
+            mod.name = data.name
+        mod.description = data.description or mod.description
+        mod.short_description = data.short_description or mod.short_description or data.description
+        if data.image_url:
+            mod.image_url = data.image_url
+        if image_path:
+            mod.image_cache_path = str(image_path)
+        mod.author = data.author or mod.author
+        mod.mod_type = data.mod_type or mod.mod_type
+        mod.mod_db_url = data.mod_db_url or mod.mod_db_url
+        mod.refreshed_at = datetime.now(timezone.utc)
+        mod.source_hash = hashlib.sha256(data.raw_json.encode()).hexdigest()
+        mod.source_updated_at = data.source_updated_at
+        mod.parse_status = "partial" if data.notes else "ok"
+        mod.parse_message = "\n".join(data.notes)[:8000] if data.notes else None
+        mod.origin = origin if mod.origin != "discord" else mod.origin
+        if origin == "discord":
+            mod.origin = "discord"
+            mod.catalog_visible = True
+            mod.parent_mod_id = None
+        else:
+            if mod.origin != "discord":
+                mod.origin = origin
+            if parent_mod_id is not None:
+                mod.parent_mod_id = parent_mod_id
+            mod.catalog_visible = catalog_visible
+        if old_page and data.mod_db_url and old_page != data.mod_db_url:
+            logger.info("[SYNC] page URL changed for %s: %s -> %s", mod.name, old_page, data.mod_db_url)
+
+    async def _replace_releases(self, session, mod: Mod, releases):
+        await session.execute(delete(ModRelease).where(ModRelease.mod_id == mod.id))
+        used: set[int] = set()
+        for pos, raw in enumerate(releases or []):
+            release_id = _stable_release_id(raw, used, pos)
+            used.add(release_id)
+            tags = raw.get("tags") or raw.get("gameversions") or raw.get("game_versions") or []
+            session.add(ModRelease(
+                mod_id=mod.id,
+                release_id=release_id,
+                mod_version=str(raw.get("modversion") or ""),
+                filename=raw.get("filename"),
+                file_id=_int_or_none(raw.get("fileid")),
+                file_url=raw.get("mainfile") or raw.get("fileurl"),
+                game_versions_json=json.dumps([str(x) for x in tags]),
+                created_at=_parse_dt(raw.get("created")),
+                changelog=raw.get("changelog"),
+                raw_json=json.dumps(raw, ensure_ascii=False),
+            ))
+        await session.flush()
+        return (await session.execute(select(ModRelease).where(ModRelease.mod_id == mod.id))).scalars().all()
+
+    def _recompute_latest(self, mod: Mod, releases):
+        tags: set[str] = set()
+        latest_release = None
+        target_game = settings.max_vintage_story_version
+        for release in releases:
+            try:
+                release_tags = json.loads(release.game_versions_json or "[]")
+            except json.JSONDecodeError:
+                release_tags = []
+            tags.update(str(x) for x in release_tags)
+            if _release_matches_branch(release_tags, target_game):
+                if latest_release is None or (version_key(release.mod_version), str(release.created_at or "")) > (version_key(latest_release.mod_version), str(latest_release.created_at or "")):
+                    latest_release = release
+        mod.latest_game_version = latest_game_version(sorted(tags), target_game)
+        mod.supported_versions_json = json.dumps(sorted(tags, key=version_key, reverse=True), ensure_ascii=False)
+        mod.latest_release_id = latest_release.id if latest_release else None
+        mod.latest_file_url = latest_release.file_url if latest_release else None
+        mod.latest_file_name = latest_release.filename if latest_release else None
+
+    async def _replace_relations_for_mod(self, session, mod: Mod, relations):
+        await session.execute(delete(Dependency).where(Dependency.mod_id == mod.id))
+        await session.execute(delete(Compatibility).where(Compatibility.mod_id == mod.id))
+        mods = (await session.execute(select(Mod))).scalars().all()
+        name_index = {normalize_name(m.name): m.id for m in mods if m.name}
+        id_index = {normalize_name(m.mod_id): m.id for m in mods if m.mod_id}
+        url_index = {str(m.mod_db_url).rstrip("/").casefold(): m.id for m in mods if m.mod_db_url}
+        asset_index = {m.mod_db_asset_id: m.id for m in mods if m.mod_db_asset_id is not None}
+        for relation in relations:
+            target_id = None
+            if relation.url:
+                target_id = url_index.get(relation.url.rstrip("/").casefold())
+                if target_id is None:
+                    aid = _asset_id_from_mod_url(relation.url)
+                    if aid is not None:
+                        target_id = asset_index.get(aid)
+            if target_id is None and relation.target_name:
+                key = normalize_name(relation.target_name)
+                target_id = name_index.get(key) or id_index.get(key)
+            model = Compatibility if relation.relation_type in {"compatible", "incompatible"} else Dependency
+            values = dict(
+                mod_id=mod.id,
+                target_mod_id=target_id,
+                target_name=relation.target_name,
+                target_url=relation.url,
+                relation_type=relation.relation_type,
+                source_kind="html",
+                raw_phrase=relation.raw_phrase,
+                evidence=relation.evidence,
+                confidence=relation.confidence,
+                verified=False,
+            )
+            if model is Dependency:
+                values["required_version"] = None
+            session.add(model(**values))
 
     async def _resolve_relation_targets(self):
         async with SessionLocal() as session:
@@ -458,9 +467,9 @@ class CatalogSyncService:
                     if row.target_url:
                         target_id = url_index.get(row.target_url.rstrip("/").casefold())
                         if target_id is None:
-                            asset_id = _asset_id_from_mod_url(row.target_url)
-                            if asset_id is not None:
-                                target_id = asset_index.get(asset_id)
+                            aid = _asset_id_from_mod_url(row.target_url)
+                            if aid is not None:
+                                target_id = asset_index.get(aid)
                     if target_id is None and row.target_name:
                         key = normalize_name(row.target_name)
                         target_id = name_index.get(key) or id_index.get(key)
@@ -468,46 +477,27 @@ class CatalogSyncService:
                         row.target_mod_id = target_id
             await session.commit()
 
-    async def _find_existing_mod(
-        self,
-        session,
-        source_url: str | None = None,
-        asset_id: int | None = None,
-        mod_db_id: int | None = None,
-        mod_id: str | None = None,
-    ):
-        # Prefer intrinsic Mod DB/game identity over a stale source-to-mod association.
+    async def _find_existing_mod(self, session, source_url=None, asset_id=None, mod_db_id=None, mod_id=None):
         if asset_id is not None:
             row = (await session.execute(select(Mod).where(Mod.mod_db_asset_id == asset_id).limit(1))).scalars().first()
-            if row:
-                return row
-        if mod_db_id is not None:
-            row = (await session.execute(select(Mod).where(Mod.mod_db_id == mod_db_id).limit(1))).scalars().first()
             if row:
                 return row
         if mod_id:
             row = (await session.execute(select(Mod).where(Mod.mod_id == mod_id).limit(1))).scalars().first()
             if row:
                 return row
-            normalized = normalize_name(mod_id)
-            mods = (await session.execute(select(Mod))).scalars().all()
-            for candidate in mods:
-                if candidate.mod_id and normalize_name(candidate.mod_id) == normalized:
-                    return candidate
+        if mod_db_id is not None:
+            row = (await session.execute(select(Mod).where(Mod.mod_db_id == mod_db_id).limit(1))).scalars().first()
+            if row:
+                return row
         clean = (source_url or "").rstrip("/")
         if clean:
             row = (await session.execute(select(Mod).where(Mod.mod_db_url == clean).limit(1))).scalars().first()
             if row:
                 return row
-            source_mod_id = (
-                await session.execute(
-                    select(DiscordSource.mod_id).where(DiscordSource.mod_db_url == clean).limit(1)
-                )
-            ).scalars().first()
+            source_mod_id = (await session.execute(select(DiscordSource.mod_id).where(DiscordSource.mod_db_url == clean).limit(1))).scalars().first()
             if source_mod_id:
-                row = await session.get(Mod, source_mod_id)
-                if row:
-                    return row
+                return await session.get(Mod, source_mod_id)
         return None
 
     async def _write_registry(self, records):
@@ -516,7 +506,7 @@ class CatalogSyncService:
         if channel is None or not hasattr(channel, "send") or client.user is None:
             return
         manifest = {
-            "schema": 3,
+            "schema": 4,
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "records": [
                 {
@@ -536,9 +526,7 @@ class CatalogSyncService:
         raw = json.dumps(manifest, ensure_ascii=False, indent=2)
         try:
             async for msg in channel.history(limit=100):
-                if msg.author.id == client.user.id and msg.attachments and any(
-                    att.filename == "mod-registry.txt" for att in msg.attachments
-                ):
+                if msg.author.id == client.user.id and msg.attachments and any(att.filename == "mod-registry.txt" for att in msg.attachments):
                     await msg.delete()
                 elif msg.author.id == client.user.id and msg.content.startswith("VS_MOD_REGISTRY:"):
                     await msg.delete()
@@ -546,6 +534,35 @@ class CatalogSyncService:
             logger.info("[DISCORD] registry updated: records=%s", len(records))
         except Exception as exc:  # noqa: BLE001
             logger.exception("[DISCORD] registry write failed: %s", exc)
+
+
+def _bad_generated_name(name: str | None) -> bool:
+    if not name:
+        return True
+    return normalize_name(name) in {"disclaimer", "mod info", "description", "files", "mods"}
+
+
+def _release_matches_branch(tags, target: str) -> bool:
+    wanted = [int(x) for x in __import__("re").findall(r"\d+", target)[:2]]
+    if len(wanted) != 2:
+        return False
+    for tag in tags:
+        nums = [int(x) for x in __import__("re").findall(r"\d+", str(tag))]
+        if len(nums) >= 2 and nums[:2] == wanted:
+            return True
+    return False
+
+
+def _stable_release_id(raw, used: set[int], pos: int) -> int:
+    for key in ("releaseid", "releaseId", "id"):
+        value = _int_or_none(raw.get(key)) if isinstance(raw, dict) else None
+        if value is not None and value not in used:
+            return value
+    seed = int(hashlib.sha256(json.dumps(raw, ensure_ascii=False, sort_keys=True).encode()).hexdigest()[:12], 16)
+    candidate = max(1, seed % 2_000_000_000)
+    while candidate in used:
+        candidate += 1
+    return candidate
 
 
 def _moddb_identifier(url: str) -> str:
@@ -559,18 +576,16 @@ def _moddb_identifier(url: str) -> str:
 
 
 def _asset_id_from_mod_url(url: str | None) -> int | None:
-    import re
-    from urllib.parse import urlparse
     if not url:
         return None
+    import re
+    from urllib.parse import urlparse
     path = urlparse(url).path.rstrip("/")
     match = re.fullmatch(r"/show/mod/(\d+)", path, re.I)
     return int(match.group(1)) if match else None
 
 
-
 def _merge_relations(relations):
-    """Merge API + HTML detections so a relation cannot violate the DB uniqueness constraint."""
     merged = {}
     for rel in relations:
         key = (
@@ -581,9 +596,8 @@ def _merge_relations(relations):
         current = merged.get(key)
         if current is None or rel.confidence > current.confidence:
             merged[key] = rel
-        elif current and len(rel.evidence or "") > len(current.evidence or ""):
-            current.evidence = rel.evidence
     return list(merged.values())
+
 
 def _int_or_none(value):
     try:
@@ -591,27 +605,6 @@ def _int_or_none(value):
     except (TypeError, ValueError):
         return None
 
-def _source_fingerprint(raw_hash: str) -> str:
-    """Bind Discord source hashes to the catalog parser/sync version.
-
-    This makes a catalog algorithm upgrade a one-time repair pass: existing
-    Discord sources are reprocessed once even when the Discord messages did not
-    change. After that, identical sources remain incremental as before.
-    """
-    payload = f"catalog-source-v{settings.catalog_source_version}:{raw_hash}"
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
-
-
-def _stable_release_id(raw: dict, used: set[int], position: int) -> int:
-    """Return a deterministic per-mod release ID even for malformed API rows."""
-    rid = _int_or_none(raw.get("releaseid"))
-    if rid is not None and rid > 0 and rid not in used:
-        return rid
-    file_id = _int_or_none(raw.get("fileid"))
-    candidate = -file_id if file_id and file_id > 0 else -(position + 1)
-    while candidate in used:
-        candidate -= 1
-    return candidate
 
 def _parse_dt(value):
     if not value:
@@ -622,12 +615,5 @@ def _parse_dt(value):
         return None
 
 
-def _version_key(value: str):
-    import re
-    text = str(value or "")
-    raw_nums = [int(x) for x in re.findall(r"\d+", text)[:4]]
-    nums = tuple((raw_nums + [0, 0, 0, 0])[:4])
-    stable = 1 if not re.search(r"(?:pre|rc|alpha|beta|dev)", text, re.I) else 0
-    # Fixed tuple shape prevents Python from ever comparing ints with strings
-    # when Mod DB returns versions such as `1.22`, `1.22.7` and `1.22.7-pre`.
-    return nums + (stable, text.lower())
+def _source_fingerprint(raw_hash: str) -> str:
+    return hashlib.sha256(f"{settings.catalog_source_version}:{raw_hash}".encode()).hexdigest()

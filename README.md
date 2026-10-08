@@ -12,7 +12,7 @@
 - Проверка сборки перед созданием: отсутствующие обязательные зависимости, incompatibility и отсутствие релиза для целевой версии VS.
 - Share ID вместо большого JSON в URL.
 - Discord-публикация готовой сборки.
-- Параллельная скачка модов с ограничением запросов и файловым кешем. Скомпилированные ZIP-сборки не сохраняются в `data`: при скачивании архив временно создаётся в системном temp и после ответа удаляется.
+- Параллельная скачка модов с ограничением запросов и файловым кешем. После синхронизации запускается фоновая предзагрузка для `MAX_VINTAGE_STORY_VERSION`; готовые ZIP-сборки не сохраняются в `data`.
 - Кеширование обложек в `data/cache/images` с локальной раздачей через `/media/images/{mod_id}`.
 - Компактное описание карточки берётся из `/api/mods`; внутренний API `modid` и публичный `assetid` `/show/mod/N` хранятся раздельно, а исходный URL из Discord сохраняется как ссылка на страницу. Это не допускает подмены Ad Astra/Clothing Visually Degrades/Immersive Quicklime из-за совпавших числовых ID.
 - Shared-build URL `/build/{share_id}` восстанавливает состав сборки при открытии на другом устройстве.
@@ -104,8 +104,22 @@ The application itself also writes structured logs to `data/logs/app.log` with r
 The package configuration explicitly discovers only `app` / `app.*`, so the project's `data` directory is never interpreted as a Python package during `pip install -e .`.
 
 
-## Version 0.5.1 / catalog repair
+## Version 0.7.0 / background cache and exact dependencies
 
 This release is designed to repair catalogs created by older versions. Existing `data/app.db` may be kept. On the first sync after upgrading, the source/parser version is included in the Discord source fingerprint and triggers a one-time refresh of old records. No renaming of the `data` directory is required for `pip install -e .`: setuptools is explicitly configured to package only `app` and `app.*`.
 
 For a successful Discord scan, the registry is replaced only when the scan completes without thread-fetch errors. A partial scan never removes previously known sources.
+
+### Фоновая предзагрузка и точные зависимости
+
+После синхронизации Discord каталог автоматически запускает фоновую предзагрузку архивов для `MAX_VINTAGE_STORY_VERSION`. По умолчанию одновременно выполняются только `PREFETCH_CONCURRENCY=2` загрузки. Через `PriorityCoordinator` новая фоновая работа не начинает новый HTTP-запрос, когда пришла пользовательская задача; текущие фоновые запросы завершаются, затем пользовательская операция получает приоритет и после неё фоновые загрузки продолжаются.
+
+Кеш управляется по URL и `ModRelease`: если Mod DB возвращает более новый релиз, старый архив удаляется; если текущий `MAX_VINTAGE_STORY_VERSION` больше не допускает старый кешированный релиз, архив удаляется. Перед каждым скачиванием также читается локальный `modinfo.json`, что дёшево по ресурсам и позволяет восстанавливать точные зависимости после перезапуска приложения без повторного HTTP-запроса.
+
+В `modinfo.json` верхнеуровневый объект `dependencies` интерпретируется как точная карта `modid -> минимальная версия`, а специальный ключ `game` не является модом и не создаёт зависимость. Официальный Mod DB API принимает такой строковый `modid` напрямую через `/api/mod/{modid}`; найденные таким образом dependency-only моды сохраняются в локальной базе, получают обычные карточки и автоматически добавляются в сборку с confidence `100%`. citeturn157745search0
+
+Аддоны из сообщений Discord-тредов также становятся полноценными карточками. Выбор аддона автоматически выбирает родительский мод; родитель получает пометку `Зависимость <название>` в карточке и в списке выбранных модов. Та же логика используется для точных зависимостей из `modinfo.json`.
+
+### Версионная политика кеша
+
+`MAX_VINTAGE_STORY_VERSION` — глобальный потолок версии Vintage Story для каталога и фоновой предзагрузки. Например, при `MAX_VINTAGE_STORY_VERSION=1.22.6` мод с диапазоном `1.22.0 - 1.22.7` отображается как совместимый с `1.22.6`, а V2 `install-information` получает именно релиз модификации, выбранный Mod DB для игры 1.22.6. Старый кешированный релиз заменяется при обнаружении более нового релиза; при изменении потолка версии фоновой worker не оставляет явно несовместимый с новым потолком архив.
