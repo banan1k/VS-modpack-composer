@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Vintage Story Modpack Builder</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-main">
+      <div>
+        <div class="eyebrow">LOCAL CATALOG</div>
+        <h1>Vintage Story Modpack Builder</h1>
+      </div>
+      <button id="refreshBtn" class="icon-btn" title="Обновить каталог" aria-label="Обновить каталог">↻ <span>Обновить</span></button>
+    </div>
+    <section id="progress" class="progress hidden" aria-live="polite">
+      <div class="progress-head">
+        <strong id="progressTitle">Обновление</strong>
+        <span id="progressText"></span>
+        <strong id="progressCount"></strong>
+      </div>
+      <div class="bar"><span id="progressBar"></span></div>
+    </section>
+  </header>
+
+  <main class="shell">
+    <section class="toolbar">
+      <div class="field search-field">
+        <label for="searchInput">Поиск</label>
+        <input id="searchInput" placeholder="название, modid или описание" autocomplete="off" />
+      </div>
+      <div id="catalogMeta" class="meta">Загрузка каталога…</div>
+    </section>
+
+    <section id="catalog" class="grid"></section>
+  </main>
+
+  <aside id="selectionPanel" class="selection-panel collapsed">
+    <button id="selectionToggle" class="selection-toggle" type="button" aria-expanded="false">
+      <span><strong id="selectedCountSmall">0</strong> выбранных модов</span><span>⌃</span>
+    </button>
+    <div id="selectionList" class="selection-list"></div>
+  </aside>
+
+  <aside class="buildbar">
+    <div class="buildbar-info"><strong id="selectedCount">0</strong> модов выбрано</div>
+    <button id="createBtn" disabled>Создать сборку</button>
+  </aside>
+
+  <dialog id="buildDialog">
+    <div class="dialog-card">
+      <div class="dialog-title">Параметры сборки</div>
+      <div class="dialog-form">
+        <div class="field">
+          <label for="buildName">Название сборки</label>
+          <input id="buildName" placeholder="Например: Наш сервер 1.22.6" maxlength="160" />
+        </div>
+        <div class="field">
+          <label for="gameVersion">Vintage Story</label>
+          <input id="gameVersion" placeholder="например 1.22.7" />
+        </div>
+      </div>
+      <div class="dialog-actions">
+        <button id="buildBack" class="ghost">Отмена</button>
+        <button id="buildConfirm">Создать сборку</button>
+      </div>
+    </div>
+  </dialog>
+
+  <dialog id="issuesDialog">
+    <div class="dialog-card">
+      <div class="dialog-title">Проверка сборки</div>
+      <div id="issuesBody"></div>
+      <div class="dialog-actions">
+        <button id="issuesBack" class="ghost">Вернуться к выбору</button>
+        <button id="issuesForce">Продолжить принудительно</button>
+      </div>
+    </div>
+  </dialog>
+
+  <dialog id="publishDialog">
+    <div class="dialog-card">
+      <div class="dialog-title">Сборка создана</div>
+      <p id="shareText"></p>
+      <div class="dialog-actions">
+        <button id="noPublish" class="ghost">Не публиковать</button>
+        <button id="publishBtn">Опубликовать в Discord</button>
+      </div>
+      <div id="downloadStep" class="hidden download-step">
+        <p>Готово. Начать загрузку сборки?</p>
+        <button id="downloadBtn">Скачать ZIP</button>
+      </div>
+    </div>
+  </dialog>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

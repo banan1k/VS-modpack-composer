@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+.env
+data/
+.pytest_cache/
+**/__pycache__/
+vintage_story_modpack.egg-info/
