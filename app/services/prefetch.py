@@ -9,17 +9,18 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Awaitable, Callable
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, or_, select
 from sqlalchemy.orm import selectinload
 
 from ..config import settings
 from ..db import SessionLocal
-from ..models import Dependency, Mod, ModRelease
+from ..models import Dependency, DependencyRequest, Mod, ModRelease
 from .cache import CacheManager
 from .moddb import ModDBClient
-from .modinfo import read_dependencies
+from .modinfo import dependencies_from_modinfo, read_modinfo
+from .identity import canonical_identifier, is_core_mod_identifier, is_library_dependency
 from .priority import PriorityCoordinator
-from .versioning import is_release_compatible_with_cap, latest_game_version, version_key
+from .versioning import is_release_compatible_with_cap, is_version_compatible, latest_game_version, version_key
 
 logger = logging.getLogger(__name__)
 
@@ -38,10 +39,12 @@ class PrefetchItem:
 
 
 class PrefetchManager:
-    def __init__(self, cache: CacheManager, moddb: ModDBClient, coordinator: PriorityCoordinator):
+    def __init__(self, cache: CacheManager, moddb: ModDBClient, coordinator: PriorityCoordinator, discord_client=None):
         self.cache = cache
         self.moddb = moddb
         self.coordinator = coordinator
+        self.discord_client = discord_client
+        self._dependency_locks: dict[str, asyncio.Lock] = {}
         self._trigger = asyncio.Event()
         self._stop = asyncio.Event()
         self._task: asyncio.Task | None = None
@@ -106,6 +109,9 @@ class PrefetchManager:
                 game_version=target_game,
                 message=f"Предзагрузка модов для Vintage Story {target_game}",
             )
+            # Clean dependency-only content rows created by pre-v0.9 behavior before making
+            # the queue. Only recognized libraries remain eligible for automatic downloads.
+            await self._prune_legacy_dependency_imports()
             async with SessionLocal() as session:
                 mods = (
                     await session.execute(
@@ -146,6 +152,8 @@ class PrefetchManager:
             total = len(queue)
             await self._set_status(total=total, message=f"Кеширование: 0/{total}")
             logger.info("[PREFETCH] queued %s files for game=%s", total, target_game)
+            if total == 0:
+                logger.info("[PREFETCH] no downloadable releases matched the configured game-version cap")
             if not queue:
                 await self._set_status(running=False, current=0, total=0, message="Нет подходящих файлов")
                 return
@@ -161,11 +169,15 @@ class PrefetchManager:
                 async with sem:
                     if self._stop.is_set():
                         return
-                    async with self.coordinator.background_slot():
-                        try:
-                            cached_before = await self.cache.cached_path(
-                                item.file_url, item.filename, expected_release_id=item.release_id
-                            )
+                    try:
+                        cached_before = await self.cache.cached_path(
+                            item.file_url, item.filename, expected_release_id=item.release_id
+                        )
+
+                        # Only the network-capable cache operation occupies a background slot.
+                        # Do not keep the slot while processing local modinfo/dependencies: those
+                        # dependency lookups may need to yield to an arriving user request.
+                        async with self.coordinator.background_slot():
                             path = await self.cache.fetch_file(
                                 item.file_url,
                                 item.filename,
@@ -175,25 +187,27 @@ class PrefetchManager:
                                 expected_release_id=item.release_id,
                                 replace_stale=True,
                             )
-                            await self.cache.purge_obsolete_mod_files(item.mod_id, item.file_url)
-                            # Reading modinfo.json is local and cheap. Do it on every prefetch
-                            # pass, not only after a new HTTP download, so exact 100% dependency
-                            # relations are restored even after an application restart.
-                            await self._process_modinfo(item, path)
-                            refreshed = cached_before is None or cached_before != path
-                            logger.debug(
-                                "[PREFETCH] cache %s %s release=%s",
-                                "refreshed" if refreshed else "hit",
-                                item.mod_identifier,
-                                item.mod_version,
-                            )
-                        except Exception:
-                            async with counter_lock:
-                                error_count += 1
-                                current_errors = error_count
-                            await self._set_status(errors=current_errors)
-                            logger.exception("[PREFETCH] file fetch failed: %s", item.mod_identifier)
-                            return
+
+                        await self.cache.purge_obsolete_mod_files(item.mod_id, item.file_url)
+                        # Reading modinfo.json is local and cheap. Do it on every prefetch pass,
+                        # not only after a new HTTP download, so exact 100% dependency relations
+                        # are restored even after an application restart.
+                        await self._process_modinfo(item, path)
+
+                        refreshed = cached_before is None or cached_before != path
+                        logger.debug(
+                            "[PREFETCH] cache %s %s release=%s",
+                            "refreshed" if refreshed else "hit",
+                            item.mod_identifier,
+                            item.mod_version,
+                        )
+                    except Exception:
+                        async with counter_lock:
+                            error_count += 1
+                            current_errors = error_count
+                        await self._set_status(errors=current_errors)
+                        logger.exception("[PREFETCH] file fetch/dependency processing failed: %s", item.mod_identifier)
+                        return
                 async with counter_lock:
                     counter += 1
                     current = counter
@@ -243,11 +257,14 @@ class PrefetchManager:
                 for item in extra_queue:
                     if self._stop.is_set():
                         break
-                    async with self.coordinator.background_slot():
-                        try:
-                            await self.cache.cached_path(
-                                item.file_url, item.filename, expected_release_id=item.release_id
-                            )
+                    try:
+                        await self.cache.cached_path(
+                            item.file_url, item.filename, expected_release_id=item.release_id
+                        )
+                        # Only the actual file fetch uses background priority. Local ZIP parsing
+                        # and DB writes must happen after releasing the slot, because resolving a
+                        # dependency may itself need a low-priority HTTP request.
+                        async with self.coordinator.background_slot():
                             path = await self.cache.fetch_file(
                                 item.file_url,
                                 item.filename,
@@ -257,16 +274,16 @@ class PrefetchManager:
                                 expected_release_id=item.release_id,
                                 replace_stale=True,
                             )
-                            await self.cache.purge_obsolete_mod_files(item.mod_id, item.file_url)
-                            await self._process_modinfo(item, path)
-                            counter += 1
-                            processed_mod_ids.add(item.mod_id)
-                            await self._set_status(current=counter, total=max(total, counter), message=f"Зависимости: {counter}/{max(total, counter)}")
-                        except Exception:
-                            async with counter_lock:
-                                error_count += 1
-                            await self._set_status(errors=error_count)
-                            logger.exception("[PREFETCH] additional dependency fetch failed: %s", item.mod_identifier)
+                        await self.cache.purge_obsolete_mod_files(item.mod_id, item.file_url)
+                        await self._process_modinfo(item, path)
+                        counter += 1
+                        processed_mod_ids.add(item.mod_id)
+                        await self._set_status(current=counter, total=max(total, counter), message=f"Зависимости: {counter}/{max(total, counter)}")
+                    except Exception:
+                        async with counter_lock:
+                            error_count += 1
+                        await self._set_status(errors=error_count)
+                        logger.exception("[PREFETCH] additional dependency fetch failed: %s", item.mod_identifier)
 
             await self._set_status(
                 running=False,
@@ -278,6 +295,143 @@ class PrefetchManager:
                     if error_count == 0
                     else f"Предзагрузка завершена с ошибками: {error_count}"
                 ),
+            )
+
+    async def _prune_legacy_dependency_imports(self) -> None:
+        """Stop downloading content mods imported by older versions as dependencies.
+
+        Older builds automatically created a catalog row for every modinfo identifier. That made
+        content mods and community-specific fixes look like libraries, and caused repeated
+        dependency rows on subsequent runs. Keep positive library matches; redirect old edges to
+        a curated Discord-title alias when one exists; otherwise turn them into unresolved edges
+        and ask the user to curate the dependency in Discord.
+        """
+        requests: list[tuple[str, str, str, str | None, str, str]] = []
+        alias_resolutions: list[tuple[str, str]] = []
+        to_purge: list[int] = []
+        changed = 0
+        async with SessionLocal() as session:
+            legacy_rows = (await session.execute(
+                select(Mod).where(Mod.origin == "dependency").order_by(Mod.id)
+            )).scalars().all()
+            curated_rows = (await session.execute(
+                select(Mod).where(Mod.origin == "discord", Mod.catalog_visible.is_(True))
+            )).scalars().all()
+
+            def id_from_edge(edge, fallback: str) -> str:
+                evidence = str(edge.evidence or "")
+                prefix = "modinfo.json dependencies:"
+                if evidence.casefold().startswith(prefix.casefold()):
+                    value = evidence[len(prefix):].strip().split("=", 1)[0].strip()
+                    if value:
+                        return value
+                return fallback
+
+            for legacy in legacy_rows:
+                dep_id = str(legacy.mod_id or "").strip()
+                if not dep_id:
+                    continue
+                dep_key = canonical_identifier(legacy.canonical_id or dep_id)
+                if is_core_mod_identifier(dep_id):
+                    legacy.catalog_visible = False
+                    legacy.origin = "core_dependency"
+                    await session.execute(delete(Dependency).where(
+                        (Dependency.target_mod_id == legacy.id) | (Dependency.mod_id == legacy.id)
+                    ))
+                    changed += 1
+                    continue
+
+                if is_library_dependency(
+                    dep_id,
+                    name=legacy.name,
+                    description=legacy.short_description or legacy.description,
+                    mod_type=legacy.mod_type,
+                    configured_ids=settings.auto_library_ids,
+                ):
+                    # These are the only dependency-origin rows eligible for automatic download.
+                    if not legacy.catalog_visible:
+                        legacy.catalog_visible = True
+                        changed += 1
+                    continue
+
+                aliases = [m for m in curated_rows if canonical_identifier(m.canonical_id) == dep_key]
+                if len(aliases) > 1:
+                    logger.error(
+                        "[PREFETCH] ambiguous forum title alias for legacy dependency %s: %s",
+                        dep_id, [m.id for m in aliases],
+                    )
+                    aliases = []
+                alias = aliases[0] if aliases else None
+                if alias is not None:
+                    alias_resolutions.append((dep_key, alias.name))
+                incoming = (await session.execute(select(Dependency).where(
+                    Dependency.target_mod_id == legacy.id,
+                    Dependency.relation_type == "dependency",
+                ))).scalars().all()
+
+                for edge in incoming:
+                    source_mod = await session.get(Mod, edge.mod_id)
+                    source_name = source_mod.name if source_mod else f"mod #{edge.mod_id}"
+                    actual_dep_id = id_from_edge(edge, dep_id)
+                    actual_key = canonical_identifier(actual_dep_id)
+                    if alias is not None:
+                        conflict = (await session.execute(select(Dependency).where(
+                            Dependency.mod_id == edge.mod_id,
+                            Dependency.target_mod_id == alias.id,
+                            Dependency.relation_type == edge.relation_type,
+                            Dependency.id != edge.id,
+                        ).limit(1))).scalars().first()
+                        if conflict:
+                            conflict.required_version = conflict.required_version or edge.required_version
+                            conflict.confidence = max(float(conflict.confidence or 0), float(edge.confidence or 0))
+                            conflict.verified = bool(conflict.verified or edge.verified)
+                            await session.delete(edge)
+                        else:
+                            edge.target_mod_id = alias.id
+                            edge.target_name = alias.name
+                            edge.target_url = alias.mod_db_url
+                    else:
+                        edge.target_mod_id = None
+                        edge.target_name = legacy.name or actual_dep_id
+                        edge.target_url = legacy.mod_db_url
+                        requests.append((
+                            actual_dep_id, actual_key, legacy.name or actual_dep_id,
+                            legacy.mod_db_url, source_name, edge.required_version or "",
+                        ))
+
+                # This row is no longer a catalog item. Its historical releases/build references
+                # stay in SQLite for old builds, but it cannot be selected or downloaded by prefetch.
+                await session.execute(delete(Dependency).where(Dependency.mod_id == legacy.id))
+                legacy.catalog_visible = False
+                legacy.origin = "superseded_dependency" if alias is not None else "unresolved_dependency"
+                to_purge.append(legacy.id)
+                changed += 1
+                logger.warning(
+                    "[PREFETCH] disabled legacy non-library dependency row %s (%s)%s",
+                    legacy.name, dep_id, f"; mapped to Discord entry {alias.name!r}" if alias else "; requesting manual Discord entry",
+                )
+            if changed:
+                await session.commit()
+
+        # Old versions cached some of these non-library dependencies automatically. Remove those
+        # archives so they do not keep consuming disk space or masquerade as preloaded content.
+        # Historical builds retain release metadata and can re-download an old file on demand.
+        for mod_id in to_purge:
+            async with self.coordinator.background_slot():
+                await self.cache.purge_mod_files(mod_id)
+
+        # Registry messages are sent after committing so Discord latency never holds a DB transaction.
+        unique_requests: dict[tuple[str, str], tuple[str, str, str, str | None, str, str]] = {}
+        for request in requests:
+            unique_requests.setdefault((request[1], request[4]), request)
+        for request in unique_requests.values():
+            await self._register_dependency_request(*request)
+        for dep_key, alias_name in alias_resolutions:
+            await self._resolve_dependency_request(dep_key, alias_name)
+        if changed:
+            logger.info(
+                "[PREFETCH] legacy dependency cleanup complete: %s rows hidden, %s manual requests refreshed",
+                changed, len(unique_requests),
             )
 
     def _make_queue(self, mods: list[Mod], resolver: dict[str, dict], game_version: str) -> list[PrefetchItem]:
@@ -330,34 +484,165 @@ class PrefetchManager:
 
     async def _process_modinfo(self, item: PrefetchItem, path: Path):
         try:
-            deps = read_dependencies(path)
+            payload = read_modinfo(path)
+            deps = dependencies_from_modinfo(payload)
         except Exception as exc:  # noqa: BLE001
             logger.debug("[PREFETCH] modinfo unavailable for %s: %s", path.name, exc)
             return
+
+        await self._refresh_cached_release_metadata(item, payload)
         if not deps:
             return
 
+        logger.info(
+            "[PREFETCH] modinfo parsed %s: %s",
+            item.mod_identifier,
+            ", ".join(f"{dep} >= {version}" if version else dep for dep, version in sorted(deps.items())),
+        )
         for dep_id, required_version in deps.items():
             await self._upsert_exact_dependency(item, dep_id, required_version)
 
         logger.info(
-            "[PREFETCH] modinfo dependencies %s: %s",
+            "[PREFETCH] modinfo dependencies saved %s: %s",
             item.mod_identifier,
             ", ".join(sorted(deps)),
         )
 
+    async def _refresh_cached_release_metadata(self, item: PrefetchItem, payload: dict) -> None:
+        """Use modinfo.json's own version as the installed-archive truth.
+
+        The V2 install endpoint can select a file whose filename/version does not line up exactly
+        with an API release row. Without this reconciliation the cache could hold 0.4.0 while the
+        resolver still warned that the only available release was 0.3.2.
+        """
+        version = str(payload.get("version") or "").strip() or None
+        # Even mod archives without a modinfo version can still teach us the V2-selected file URL
+        # and filename for an already-known release.
+        if not version and not (item.file_url or item.filename):
+            return
+        async with SessionLocal() as session:
+            mod = await session.get(Mod, item.mod_id)
+            if mod is None:
+                return
+            release = await session.get(ModRelease, item.release_id) if item.release_id else None
+            if release is not None and release.mod_id != mod.id:
+                release = None
+            if release is None:
+                release = (await session.execute(
+                    select(ModRelease).where(
+                        ModRelease.mod_id == mod.id,
+                        or_(ModRelease.file_url == item.file_url, ModRelease.filename == item.filename),
+                    ).order_by(ModRelease.id.desc()).limit(1)
+                )).scalars().first()
+            if release is None:
+                if not version:
+                    return
+                existing_ids = set((await session.execute(
+                    select(ModRelease.release_id).where(ModRelease.mod_id == mod.id)
+                )).scalars().all())
+                import hashlib
+                candidate_id = max(1, int(hashlib.sha256(item.file_url.encode()).hexdigest()[:8], 16))
+                while candidate_id in existing_ids:
+                    candidate_id = 1 if candidate_id >= 2_000_000_000 else candidate_id + 1
+                release = ModRelease(
+                    mod_id=mod.id,
+                    release_id=candidate_id,
+                    mod_version=version,
+                    filename=item.filename,
+                    file_url=item.file_url,
+                    game_versions_json=json.dumps([item.game_version]),
+                    raw_json=json.dumps({"source": "v2-install-information+modinfo", "version": version}, ensure_ascii=False),
+                )
+                session.add(release)
+                await session.flush()
+            else:
+                if version and release.mod_version != version:
+                    logger.info(
+                        "[PREFETCH] corrected release version from archive: %s %r -> %r (%s)",
+                        item.mod_identifier, release.mod_version, version, item.filename,
+                    )
+                    release.mod_version = version
+                # Fill missing fields even when the version string already matches. Some V1
+                # release rows omit mainfile/file URL while V2 install-information supplied a
+                # working URL; previously this branch left the release permanently unusable.
+                if item.filename and release.filename != item.filename:
+                    release.filename = item.filename
+                if item.file_url and release.file_url != item.file_url:
+                    release.file_url = item.file_url
+                try:
+                    tags = json.loads(release.game_versions_json or "[]")
+                except (json.JSONDecodeError, TypeError):
+                    tags = []
+                if item.game_version and not is_version_compatible([str(tag) for tag in tags], item.game_version):
+                    tags.append(item.game_version)
+                    release.game_versions_json = json.dumps(list(dict.fromkeys(str(tag) for tag in tags)), ensure_ascii=False)
+            releases = (await session.execute(
+                select(ModRelease).where(ModRelease.mod_id == mod.id)
+            )).scalars().all()
+            _recompute_mod_latest(mod, releases, settings.max_vintage_story_version)
+            await session.commit()
+
+    async def _find_dependency_target(self, dep_id: str) -> Mod | None:
+        dep_key = canonical_identifier(dep_id)
+        dep_exact = str(dep_id or "").strip().casefold()
+        async with SessionLocal() as session:
+            candidates = (await session.execute(
+                select(Mod).where(
+                    Mod.catalog_visible.is_(True),
+                    or_(
+                        func.lower(Mod.mod_id) == dep_exact,
+                        func.lower(Mod.canonical_id) == dep_key,
+                    ),
+                ).order_by(Mod.id)
+            )).scalars().all()
+        if not candidates:
+            return None
+        # A deliberate Discord title is an override: a forum post titled "Ancient Armory" can
+        # point at a 1.22 fix whose actual modinfo ID is different. Prefer that curated alias over
+        # a stale automatically discovered dependency-only copy of the original mod.
+        candidates.sort(key=lambda mod: (
+            0 if mod.origin == "discord" and canonical_identifier(mod.canonical_id) == dep_key else 1,
+            0 if mod.origin != "dependency" else 1,
+            0 if str(mod.mod_id or "").casefold() == dep_exact else 1,
+            mod.id,
+        ))
+        # If multiple curated posts claim the same canonical identifier, avoid guessing.
+        top = candidates[0]
+        same_rank = [m for m in candidates if (
+            m.origin == "discord" and canonical_identifier(m.canonical_id) == dep_key
+        ) == (top.origin == "discord" and canonical_identifier(top.canonical_id) == dep_key)]
+        if top.origin == "discord" and canonical_identifier(top.canonical_id) == dep_key and len(same_rank) > 1:
+            logger.error("[PREFETCH] ambiguous Discord canonical dependency ID %s maps to mod rows %s", dep_id, [m.id for m in same_rank])
+            return None
+        return top
+
     async def _upsert_exact_dependency(self, source: PrefetchItem, dep_id: str, required_version: str):
-        dep_norm = dep_id.casefold()
+        # `game`, `survival`, and `creative` are core game components shipped with Vintage Story,
+        # not third-party downloads. Do not catalog them as ordinary mods or show missing-release warnings.
+        if is_core_mod_identifier(dep_id):
+            logger.debug("[PREFETCH] ignored core dependency %s for %s", dep_id, source.mod_identifier)
+            return
+        dep_key = canonical_identifier(dep_id)
+        if not dep_key:
+            return
+        lock = self._dependency_locks.setdefault(dep_key, asyncio.Lock())
+        async with lock:
+            await self._upsert_exact_dependency_locked(source, dep_id, required_version, dep_key)
+
+    async def _upsert_exact_dependency_locked(
+        self, source: PrefetchItem, dep_id: str, required_version: str, dep_key: str
+    ):
         async with SessionLocal() as session:
             source_mod = await session.get(Mod, source.mod_id)
-            target = (
-                await session.execute(
-                    select(Mod).where(func.lower(Mod.mod_id) == dep_norm).limit(1)
-                )
-            ).scalars().first() if source_mod else None
+            source_name = source_mod.name if source_mod else source.mod_identifier
         if source_mod is None:
             return
 
+        target = await self._find_dependency_target(dep_id)
+        data = None
+        known_library = is_library_dependency(
+            dep_id, configured_ids=settings.auto_library_ids
+        )
         if target is None:
             try:
                 async with self.coordinator.background_slot():
@@ -369,105 +654,279 @@ class PrefetchManager:
                     )
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
-                    "[PREFETCH] exact dependency resolve failed %s -> %s: %s",
-                    source.mod_identifier,
-                    dep_id,
-                    exc,
+                    "[PREFETCH] exact dependency metadata failed %s -> %s: %s",
+                    source.mod_identifier, dep_id, exc,
                 )
-                return
-            async with SessionLocal() as session:
-                target = (
-                    await session.execute(
-                        select(Mod).where(func.lower(Mod.mod_id) == dep_norm).limit(1)
-                    )
-                ).scalars().first()
-                if target is None:
-                    target = Mod(
-                        mod_db_id=data.mod_db_id,
-                        mod_db_asset_id=data.asset_id,
-                        mod_id=data.mod_id or dep_id,
-                        name=data.name or dep_id,
-                        description=data.description,
-                        short_description=data.short_description,
-                        image_url=data.image_url,
-                        author=data.author,
-                        mod_type=data.mod_type,
-                        mod_db_url=data.mod_db_url,
-                        catalog_visible=True,
-                        origin="dependency",
-                        parse_status="partial" if data.notes else "ok",
-                        parse_message="\n".join(data.notes)[:8000] if data.notes else None,
-                    )
-                    session.add(target)
-                    await session.flush()
-                    await _replace_dependency_releases(session, target, data.releases)
-                    _recompute_mod_latest(target, list(target.releases), settings.max_vintage_story_version)
-                    await session.commit()
-                    logger.info("[PREFETCH] discovered dependency mod %s", dep_id)
+                if known_library:
+                    target = await self._upsert_library_record(dep_id, dep_key, None)
                 else:
-                    target.catalog_visible = True
-                    if target.origin != "discord":
-                        target.origin = "dependency"
-                    if data.name:
-                        target.name = data.name
-                    target.description = data.description or target.description
-                    target.short_description = data.short_description or target.short_description or data.description
-                    target.image_url = data.image_url or target.image_url
-                    target.mod_db_id = data.mod_db_id or target.mod_db_id
-                    target.mod_db_asset_id = data.asset_id or target.mod_db_asset_id
-                    target.mod_db_url = data.mod_db_url or target.mod_db_url
-                    if data.releases:
-                        await _replace_dependency_releases(session, target, data.releases)
-                        target_releases = (
-                            await session.execute(select(ModRelease).where(ModRelease.mod_id == target.id))
-                        ).scalars().all()
-                        _recompute_mod_latest(target, target_releases, settings.max_vintage_story_version)
-                    await session.commit()
-
-        async with SessionLocal() as session:
-            target = (
-                await session.execute(
-                    select(Mod).where(func.lower(Mod.mod_id) == dep_norm).limit(1)
-                )
-            ).scalars().first()
-            if not target:
-                return
-            existing = (
-                await session.execute(
-                    select(Dependency).where(
-                        Dependency.mod_id == source.mod_id,
-                        Dependency.target_mod_id == target.id,
-                        Dependency.relation_type == "dependency",
+                    await self._upsert_dependency_edge(
+                        source.mod_id, dep_id, required_version, None,
+                        target_name=dep_id, target_url=None,
                     )
+                    await self._register_dependency_request(
+                        dep_id, dep_key, dep_id, None, source_name, required_version
+                    )
+                    return
+
+            if target is None and data is not None:
+                is_library = is_library_dependency(
+                    dep_id,
+                    name=data.name,
+                    description=data.short_description or data.description,
+                    mod_type=data.mod_type,
+                    configured_ids=settings.auto_library_ids,
                 )
-            ).scalars().first()
+                if is_library:
+                    target = await self._upsert_library_record(dep_id, dep_key, data)
+                else:
+                    display_name = data.name or dep_id
+                    logger.warning(
+                        "[PREFETCH] manual Discord catalog entry required: dependency=%s (%s), required_by=%s",
+                        dep_id, display_name, source_name,
+                    )
+                    await self._upsert_dependency_edge(
+                        source.mod_id, dep_id, required_version, None,
+                        target_name=display_name, target_url=data.mod_db_url,
+                    )
+                    await self._register_dependency_request(
+                        dep_id, dep_key, display_name, data.mod_db_url, source_name, required_version
+                    )
+                    return
+
+        if target is None:
+            await self._upsert_dependency_edge(
+                source.mod_id, dep_id, required_version, None,
+                target_name=(data.name if data else None) or dep_id,
+                target_url=(data.mod_db_url if data else None),
+            )
+            return
+
+        await self._resolve_dependency_request(dep_key, target.name)
+        await self._upsert_dependency_edge(
+            source.mod_id, dep_id, required_version, target.id,
+            target_name=target.name, target_url=target.mod_db_url,
+        )
+
+    async def _upsert_library_record(self, dep_id: str, dep_key: str, data) -> Mod | None:
+        async with SessionLocal() as session:
+            target = (await session.execute(select(Mod).where(
+                Mod.catalog_visible.is_(True),
+                or_(
+                    func.lower(Mod.mod_id) == str(dep_id).casefold(),
+                    func.lower(Mod.canonical_id) == dep_key,
+                ),
+            ).order_by(Mod.id).limit(1))).scalars().first()
+            if target is None:
+                target = Mod(
+                    mod_db_id=data.mod_db_id if data else None,
+                    mod_db_asset_id=data.asset_id if data else None,
+                    mod_id=(data.mod_id if data and data.mod_id else dep_id),
+                    canonical_id=dep_key,
+                    name=(data.name if data else None) or dep_id,
+                    description=data.description if data else None,
+                    short_description=(data.short_description if data else None) or (data.description if data else None),
+                    image_url=data.image_url if data else None,
+                    author=data.author if data else None,
+                    mod_type=data.mod_type if data else "library",
+                    mod_db_url=(data.mod_db_url if data else None) or f"{self.moddb.site_base}/{dep_id}",
+                    catalog_visible=True,
+                    origin="dependency",
+                    parse_status="partial" if data is None or (data and data.notes) else "ok",
+                    parse_message=("Mod DB lookup unavailable; retry on next prefetch" if data is None else "\n".join(data.notes)[:8000] if data.notes else None),
+                )
+                session.add(target)
+                await session.flush()
+                if data and data.releases:
+                    await _replace_dependency_releases(session, target, data.releases)
+            elif target.origin in {"dependency", "unresolved_dependency"} and data is not None:
+                target.origin = "dependency"
+                target.catalog_visible = True
+                target.canonical_id = target.canonical_id or dep_key
+                if data.name:
+                    target.name = data.name
+                target.description = data.description or target.description
+                target.short_description = data.short_description or target.short_description or data.description
+                target.image_url = data.image_url or target.image_url
+                target.author = data.author or target.author
+                target.mod_type = data.mod_type or target.mod_type
+                target.mod_db_id = data.mod_db_id or target.mod_db_id
+                target.mod_db_asset_id = data.asset_id or target.mod_db_asset_id
+                target.mod_db_url = data.mod_db_url or target.mod_db_url
+                if data.releases:
+                    await _replace_dependency_releases(session, target, data.releases)
+            # Never read target.releases as an ORM relationship in async code; query them explicitly.
+            target_id = target.id
+            releases = (await session.execute(select(ModRelease).where(ModRelease.mod_id == target_id))).scalars().all()
+            _recompute_mod_latest(target, releases, settings.max_vintage_story_version)
+            await session.commit()
+        return await self._find_dependency_target(dep_id)
+
+    async def _upsert_dependency_edge(
+        self, source_mod_id: int, dep_id: str, required_version: str, target_mod_id: int | None,
+        *, target_name: str | None, target_url: str | None,
+    ):
+        dep_key = canonical_identifier(dep_id)
+        async with SessionLocal() as session:
+            # NULL target IDs do not collide under SQLite UNIQUE constraints; match unresolved
+            # rows by their exact modinfo identifier to prevent a new relation on every restart.
+            rows = (await session.execute(select(Dependency).where(
+                Dependency.mod_id == source_mod_id,
+                Dependency.relation_type == "dependency",
+            ))).scalars().all()
+            def edge_identifier(row):
+                evidence = str(row.evidence or "")
+                prefix = "modinfo.json dependencies:"
+                if evidence.casefold().startswith(prefix.casefold()):
+                    identifier_part = evidence[len(prefix):].strip().split("=", 1)[0].strip()
+                    return canonical_identifier(identifier_part)
+                return ""
+
+            matches = [row for row in rows if (
+                (target_mod_id is not None and row.target_mod_id == target_mod_id) or
+                (row.target_mod_id is None and (
+                    canonical_identifier(row.target_name) == dep_key or edge_identifier(row) == dep_key
+                ))
+            )]
+            # Prefer an already-resolved edge, otherwise upgrade the first matching unresolved
+            # row. Remove older duplicates left by previous versions (nullable target IDs are not
+            # protected by SQLite's normal UNIQUE constraint).
+            existing = next((row for row in matches if row.target_mod_id == target_mod_id and target_mod_id is not None), None)
+            if existing is None and matches:
+                existing = matches[0]
+            for duplicate in matches:
+                if duplicate is not existing:
+                    await session.delete(duplicate)
             evidence = f"modinfo.json dependencies: {dep_id}={required_version}"
-            if existing:
+            if existing is None:
+                existing = Dependency(
+                    mod_id=source_mod_id,
+                    target_mod_id=target_mod_id,
+                    target_name=target_name,
+                    target_url=target_url,
+                    relation_type="dependency",
+                    required_version=required_version or None,
+                    source_kind="modinfo",
+                    raw_phrase="dependencies",
+                    evidence=evidence,
+                    confidence=1.0,
+                    verified=True,
+                )
+                session.add(existing)
+            else:
+                existing.target_mod_id = target_mod_id
+                existing.target_name = target_name or existing.target_name
+                existing.target_url = target_url or existing.target_url
                 existing.required_version = required_version or None
                 existing.source_kind = "modinfo"
                 existing.confidence = 1.0
                 existing.verified = True
-                existing.target_name = target.name
-                existing.target_url = target.mod_db_url
                 existing.evidence = evidence
                 existing.raw_phrase = "dependencies"
-            else:
-                session.add(
-                    Dependency(
-                        mod_id=source.mod_id,
-                        target_mod_id=target.id,
-                        target_name=target.name,
-                        target_url=target.mod_db_url,
-                        relation_type="dependency",
-                        required_version=required_version or None,
-                        source_kind="modinfo",
-                        raw_phrase="dependencies",
-                        evidence=evidence,
-                        confidence=1.0,
-                        verified=True,
-                    )
-                )
             await session.commit()
+
+    async def flush_open_dependency_requests(self) -> None:
+        """Send persisted dependency requests after the Discord Gateway becomes ready."""
+        async with SessionLocal() as session:
+            rows = (await session.execute(select(DependencyRequest).where(
+                DependencyRequest.status == "open",
+                DependencyRequest.discord_message_id.is_(None),
+            ).order_by(DependencyRequest.id))).scalars().all()
+            pending = [
+                (r.mod_identifier, r.requested_name, r.target_url, r.required_by_json)
+                for r in rows
+            ]
+        for dep_key, requested_name, target_url, required_by_json in pending:
+            try:
+                required_by = json.loads(required_by_json or "[]")
+            except json.JSONDecodeError:
+                required_by = []
+            first = required_by[0] if required_by else {"name": "unknown mod", "version": ""}
+            await self._register_dependency_request(
+                dep_key, dep_key, requested_name, target_url,
+                str(first.get("name") or "unknown mod"), str(first.get("version") or ""),
+            )
+
+    async def _register_dependency_request(
+        self, dep_id: str, dep_key: str, requested_name: str, target_url: str | None,
+        source_name: str, required_version: str,
+    ):
+        async with SessionLocal() as session:
+            request = (await session.execute(select(DependencyRequest).where(
+                DependencyRequest.mod_identifier == dep_key
+            ))).scalars().first()
+            required_by = []
+            if request:
+                try:
+                    required_by = json.loads(request.required_by_json or "[]")
+                except json.JSONDecodeError:
+                    required_by = []
+            entry = {"name": source_name, "version": required_version or ""}
+            if entry not in required_by:
+                required_by.append(entry)
+            if request is None:
+                request = DependencyRequest(
+                    mod_identifier=dep_key,
+                    requested_name=requested_name or dep_id,
+                    target_url=target_url,
+                    required_by_json=json.dumps(required_by, ensure_ascii=False),
+                    status="open",
+                )
+                session.add(request)
+                await session.flush()
+            else:
+                request.requested_name = requested_name or request.requested_name
+                request.target_url = target_url or request.target_url
+                request.required_by_json = json.dumps(required_by, ensure_ascii=False)
+                request.status = "open"
+            request_id = request.id
+            message_id = request.discord_message_id
+            await session.commit()
+
+        if message_id or not settings.discord_registry_channel_id or not self.discord_client or not self.discord_client.is_ready():
+            return
+        channel = self.discord_client.get_channel(settings.discord_registry_channel_id)
+        if channel is None:
+            try:
+                channel = await self.discord_client.fetch_channel(settings.discord_registry_channel_id)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[PREFETCH] cannot open registry channel for dependency request %s: %s", dep_id, exc)
+                return
+        if not hasattr(channel, "send"):
+            logger.warning("[PREFETCH] registry channel does not allow messages for dependency request %s", dep_id)
+            return
+        req_lines = [entry["name"] + (f" (requires {entry['version']})" if entry.get("version") else "") for entry in required_by]
+        canonical_title = (requested_name or dep_id).strip()
+        content = (
+            f"📌 **Нужно добавить зависимость в каталог модов**\n"
+            f"Название: **{requested_name or dep_id}**\n"
+            f"`modinfo` ID: `{dep_id}`\n"
+            f"Требуют: {', '.join(req_lines[:12]) or 'неизвестно'}\n"
+            f"\nДобавьте форумный пост в один из настроенных каналов модов. **Заголовок поста должен быть `{canonical_title}`** — это имя будет использоваться для сопоставления зависимости. Ссылку можно дать на актуальный фикс/форк, даже если его внутренний modid отличается. После «Обновить» программа сопоставит зависимость по заголовку."
+        )
+        if target_url and target_url.startswith(("http://", "https://")):
+            content += f"\nСтраница Mod DB: {target_url}"
+        try:
+            message = await channel.send(content[:1900])
+            async with SessionLocal() as session:
+                request = await session.get(DependencyRequest, request_id)
+                if request and not request.discord_message_id:
+                    request.discord_message_id = message.id
+                    await session.commit()
+            logger.info("[PREFETCH] requested manual Discord entry for %s (%s)", dep_id, requested_name)
+        except Exception:
+            logger.exception("[PREFETCH] failed to post dependency request for %s", dep_id)
+
+    async def _resolve_dependency_request(self, dep_key: str, resolved_name: str):
+        async with SessionLocal() as session:
+            request = (await session.execute(select(DependencyRequest).where(
+                DependencyRequest.mod_identifier == dep_key
+            ))).scalars().first()
+            if request and request.status != "resolved":
+                request.status = "resolved"
+                request.requested_name = resolved_name or request.requested_name
+                await session.commit()
+                logger.info("[PREFETCH] manual dependency request resolved: %s -> %s", dep_key, resolved_name)
 
 
 async def _replace_dependency_releases(session, mod: Mod, releases: list[dict]):
@@ -531,12 +990,16 @@ def _recompute_mod_latest(mod: Mod, releases: list[ModRelease], cap: str):
 
 
 def _has_local_release_for_cap(mod: Mod, cap: str) -> bool:
+    """Return whether the catalog already has a usable release for ``cap``.
+
+    ``_release_matches_cap`` accepts a ModRelease object, so keep the object
+    intact here. The previous implementation decoded ``game_versions_json``
+    into a list and then passed that list to ``_release_matches_cap``; this
+    caused the background prefetch worker to crash before it ever reached the
+    download queue.
+    """
     for release in mod.releases:
-        try:
-            tags = json.loads(release.game_versions_json or "[]")
-        except json.JSONDecodeError:
-            tags = []
-        if _release_matches_cap(tags, cap) and release.file_url:
+        if release.file_url and _release_matches_cap(release, cap):
             return True
     return False
 

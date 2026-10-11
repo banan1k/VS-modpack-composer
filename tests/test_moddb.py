@@ -165,3 +165,34 @@ def test_page_only_fallback_does_not_call_show_mod_number_as_api_id(monkeypatch)
     result = asyncio.run(client.get_mod("64026", source_url="https://mods.vintagestory.at/show/mod/64026", catalog_rows=[]))
     assert result.asset_id == 64026
     assert result.mod_db_url.endswith("/show/mod/64026")
+
+
+def test_get_latest_release_uses_internal_mod_db_id_and_identifier(monkeypatch):
+    calls = []
+
+    class Response:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {
+                "releaseId": 12345,
+                "identifier": "fixedpaths",
+                "version": "1.0.2",
+                "fileName": "FixedPaths.zip",
+                "fileUrl": "/download/12345/FixedPaths.zip",
+            }
+
+    class FakeClient:
+        async def get(self, url, **kwargs):
+            calls.append((url, kwargs.get("params")))
+            return Response()
+
+    client = ModDBClient("https://mods.vintagestory.at/api", "https://mods.vintagestory.at")
+    monkeypatch.setattr(client, "_get_client", lambda: asyncio.sleep(0, result=FakeClient()))
+    result = asyncio.run(client.get_latest_release(1896, identifier="fixedpaths"))
+    assert result["fileUrl"] == "/download/12345/FixedPaths.zip"
+    assert calls == [(
+        "https://mods.vintagestory.at/api/v2/mods/1896/releases/latest",
+        {"identifier": "fixedpaths"},
+    )]

@@ -19,6 +19,9 @@ class Mod(Base):
     mod_db_asset_id: Mapped[int | None] = mapped_column(Integer, index=True)
     # Vintage Story modinfo identifier.
     mod_id: Mapped[str | None] = mapped_column(String(120), index=True)
+    # Canonical identity derived from the Discord forum post title. Allows a post titled
+    # "Ancient Armory" to point at a compatible fork while satisfying modinfo dependency "ancientarmory".
+    canonical_id: Mapped[str | None] = mapped_column(String(180), index=True)
     name: Mapped[str] = mapped_column(String(300), index=True)
     description: Mapped[str | None] = mapped_column(Text)
     short_description: Mapped[str | None] = mapped_column(Text)
@@ -138,6 +141,7 @@ class Build(Base):
     published: Mapped[bool] = mapped_column(Boolean, default=False)
     discord_message_id: Mapped[int | None] = mapped_column(Integer)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)
+    schema_version: Mapped[int] = mapped_column(Integer, default=1)
 
     mods: Mapped[list["BuildMod"]] = relationship(
         back_populates="build", cascade="all, delete-orphan", order_by="BuildMod.position"
@@ -152,6 +156,9 @@ class BuildMod(Base):
     mod_id: Mapped[int] = mapped_column(ForeignKey("mods.id", ondelete="RESTRICT"))
     release_id: Mapped[int | None] = mapped_column(ForeignKey("mod_releases.id", ondelete="SET NULL"))
     selected_version: Mapped[str | None] = mapped_column(String(120))
+    # Persist the exact file returned by Mod DB V2. It may not map to a legacy ModRelease row.
+    selected_file_url: Mapped[str | None] = mapped_column(Text)
+    selected_file_name: Mapped[str | None] = mapped_column(String(500))
     auto_added: Mapped[bool] = mapped_column(Boolean, default=False)
     position: Mapped[int] = mapped_column(Integer)
     build: Mapped["Build"] = relationship(back_populates="mods")
@@ -181,5 +188,22 @@ class Job(Base):
     total: Mapped[int] = mapped_column(Integer, default=0)
     message: Mapped[str | None] = mapped_column(Text)
     errors_json: Mapped[str] = mapped_column(Text, default="[]")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, onupdate=now_utc)
+
+
+class DependencyRequest(Base):
+    """Tracks required non-library mods that must be deliberately added to Discord."""
+
+    __tablename__ = "dependency_requests"
+    __table_args__ = (UniqueConstraint("mod_identifier", name="uq_dependency_request_identifier"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    mod_identifier: Mapped[str] = mapped_column(String(180), index=True)
+    requested_name: Mapped[str] = mapped_column(String(300))
+    target_url: Mapped[str | None] = mapped_column(Text)
+    required_by_json: Mapped[str] = mapped_column(Text, default="[]")
+    status: Mapped[str] = mapped_column(String(30), default="open", index=True)
+    discord_message_id: Mapped[int | None] = mapped_column(Integer)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, onupdate=now_utc)

@@ -1,9 +1,13 @@
 .venv/
 __pycache__/
+**/__pycache__/
 .pytest_cache/
 .ruff_cache/
 .env
+*.py[cod]
+*.egg-info/
+/build/
+/dist/
 data/
-.pytest_cache/
-**/__pycache__/
-vintage_story_modpack.egg-info/
+.DS_Store
+Thumbs.db

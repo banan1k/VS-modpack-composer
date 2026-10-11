@@ -21,7 +21,8 @@ class Settings(BaseSettings):
     relation_min_confidence: float = 0.90
     max_vintage_story_version: str = "1.22.7"
     prefetch_concurrency: int = 2
-    catalog_source_version: str = "13"
+    catalog_source_version: str = "15"
+    auto_library_modids: str = "imgui,libgui,musicvolumebalancer"
 
     discord_token: str | None = None
     discord_guild_id: int | None = None
@@ -44,6 +45,12 @@ class Settings(BaseSettings):
             except ValueError:
                 raise ValueError(f"Invalid Discord forum channel ID: {value!r}") from None
         return list(dict.fromkeys(ids))
+
+    @property
+    def auto_library_ids(self) -> set[str]:
+        from .services.identity import canonical_identifier
+        values = self.auto_library_modids.replace(";", ",").split(",")
+        return {canonical_identifier(v) for v in values if v.strip()}
 
     @property
     def image_cache_dir(self) -> Path:

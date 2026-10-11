@@ -18,6 +18,7 @@ from .cache import CacheManager
 from .discord_ingest import DiscordCatalogScanner, DiscordModRecord, DiscordScanResult
 from .moddb import ModDBClient, ModDBData
 from .parser import extract_api_relationships, extract_relationships, normalize_name
+from .identity import canonical_identifier
 from .versioning import latest_game_version, version_key
 
 logger = logging.getLogger(__name__)
@@ -272,6 +273,9 @@ class CatalogSyncService:
                 await session.flush()
 
             self._apply_mod_data(mod, data, image_path, origin="discord", parent_mod_id=None, catalog_visible=True)
+            # The human forum-post title is a deliberate alias for dependency resolution. The linked
+            # page may be a fixed/forked build with a different in-game modinfo identifier.
+            mod.canonical_id = canonical_identifier(rec.title)
             release_rows = await self._replace_releases(session, mod, data.releases)
             self._recompute_latest(mod, release_rows)
 
@@ -322,6 +326,7 @@ class CatalogSyncService:
                     session.add(child)
                     await session.flush()
                 self._apply_mod_data(child, addon_data, addon_image, origin="addon", parent_mod_id=mod.id, catalog_visible=True)
+                child.canonical_id = canonical_identifier(addon.get("title") or addon_data.name)
                 child_release_rows = await self._replace_releases(session, child, addon_data.releases)
                 self._recompute_latest(child, child_release_rows)
                 session.add(Addon(
@@ -423,9 +428,25 @@ class CatalogSyncService:
         mods = (await session.execute(select(Mod))).scalars().all()
         name_index = {normalize_name(m.name): m.id for m in mods if m.name}
         id_index = {normalize_name(m.mod_id): m.id for m in mods if m.mod_id}
+        canonical_index = {canonical_identifier(m.canonical_id): m.id for m in mods if m.canonical_id}
         url_index = {str(m.mod_db_url).rstrip("/").casefold(): m.id for m in mods if m.mod_db_url}
         asset_index = {m.mod_db_asset_id: m.id for m in mods if m.mod_db_asset_id is not None}
+        unique_relations = {}
         for relation in relations:
+            identity = (
+                relation.relation_type,
+                (relation.url or "").rstrip("/").casefold(),
+                normalize_name(relation.target_name or ""),
+            )
+            prior = unique_relations.get(identity)
+            if prior is None:
+                unique_relations[identity] = relation
+            else:
+                prior.confidence = max(float(prior.confidence or 0), float(relation.confidence or 0))
+                if not prior.evidence and relation.evidence:
+                    prior.evidence = relation.evidence
+        seen_resolved_edges = {}
+        for relation in unique_relations.values():
             target_id = None
             if relation.url:
                 target_id = url_index.get(relation.url.rstrip("/").casefold())
@@ -435,8 +456,22 @@ class CatalogSyncService:
                         target_id = asset_index.get(aid)
             if target_id is None and relation.target_name:
                 key = normalize_name(relation.target_name)
-                target_id = name_index.get(key) or id_index.get(key)
+                target_id = name_index.get(key) or id_index.get(key) or canonical_index.get(canonical_identifier(relation.target_name))
             model = Compatibility if relation.relation_type in {"compatible", "incompatible"} else Dependency
+            edge_key = (
+                model,
+                target_id if target_id is not None else None,
+                relation.relation_type,
+                "" if target_id is not None else (
+                    (relation.url or "").rstrip("/").casefold() or normalize_name(relation.target_name or "")
+                ),
+            )
+            previous = seen_resolved_edges.get(edge_key)
+            if previous is not None:
+                previous.confidence = max(float(previous.confidence or 0), float(relation.confidence or 0))
+                if not previous.evidence and relation.evidence:
+                    previous.evidence = relation.evidence
+                continue
             values = dict(
                 mod_id=mod.id,
                 target_mod_id=target_id,
@@ -451,17 +486,39 @@ class CatalogSyncService:
             )
             if model is Dependency:
                 values["required_version"] = None
-            session.add(model(**values))
+            resolved_edge = model(**values)
+            session.add(resolved_edge)
+            seen_resolved_edges[edge_key] = resolved_edge
 
     async def _resolve_relation_targets(self):
+        """Resolve relation targets in a uniqueness-safe two-phase pass.
+
+        Several fuzzy HTML relations can initially have NULL targets, then resolve to the same
+        mod. Updating the first row before querying the second causes SQLAlchemy autoflush to hit
+        UNIQUE(mod_id, target_mod_id, relation_type). Resolve the full mapping first, merge
+        collisions, flush deletes, and only then apply target ID updates.
+        """
         async with SessionLocal() as session:
             mods = (await session.execute(select(Mod))).scalars().all()
             name_index = {normalize_name(m.name): m.id for m in mods if m.name}
             id_index = {normalize_name(m.mod_id): m.id for m in mods if m.mod_id}
+            canonical_index = {canonical_identifier(m.canonical_id): m.id for m in mods if m.canonical_id}
             url_index = {str(m.mod_db_url).rstrip("/").casefold(): m.id for m in mods if m.mod_db_url}
             asset_index = {m.mod_db_asset_id: m.id for m in mods if m.mod_db_asset_id is not None}
-            for model in (Dependency, Compatibility):
-                rows = (await session.execute(select(model))).scalars().all()
+
+            # Load both tables before changing any rows so querying the second table cannot
+            # autoflush pending target-ID changes from the first one.
+            rows_by_model = {
+                model: (await session.execute(select(model).order_by(model.id))).scalars().all()
+                for model in (Dependency, Compatibility)
+            }
+            loser_ids: set[tuple[type, int]] = set()
+            target_map: dict[tuple[type, int], int | None] = {}
+            rows_by_id: dict[tuple[type, int], object] = {}
+
+            for model, rows in rows_by_model.items():
+                planned: dict[int, int | None] = {}
+                by_final_key: dict[tuple[int, int, str], list] = {}
                 for row in rows:
                     target_id = None
                     if row.target_url:
@@ -472,9 +529,54 @@ class CatalogSyncService:
                                 target_id = asset_index.get(aid)
                     if target_id is None and row.target_name:
                         key = normalize_name(row.target_name)
-                        target_id = name_index.get(key) or id_index.get(key)
-                    if target_id and target_id != row.mod_id:
-                        row.target_mod_id = target_id
+                        target_id = name_index.get(key) or id_index.get(key) or canonical_index.get(canonical_identifier(row.target_name))
+                    final_target = target_id if target_id and target_id != row.mod_id else row.target_mod_id
+                    planned[row.id] = final_target
+                    rows_by_id[(model, row.id)] = row
+                    if final_target is not None:
+                        by_final_key.setdefault((row.mod_id, final_target, row.relation_type), []).append(row)
+
+                for final_key, group in by_final_key.items():
+                    if len(group) < 2:
+                        continue
+                    # Prefer an edge already at its final target, then the strongest/verified edge.
+                    final_target = final_key[1]
+                    survivor = min(
+                        group,
+                        key=lambda row: (
+                            0 if row.target_mod_id == final_target else 1,
+                            -float(row.confidence or 0),
+                            0 if bool(row.verified) else 1,
+                            row.id,
+                        ),
+                    )
+                    for other in group:
+                        if other is survivor:
+                            continue
+                        survivor.confidence = max(float(survivor.confidence or 0), float(other.confidence or 0))
+                        survivor.verified = bool(survivor.verified or other.verified)
+                        if hasattr(survivor, "required_version") and not survivor.required_version and other.required_version:
+                            survivor.required_version = other.required_version
+                        for field in ("target_name", "target_url", "source_kind", "raw_phrase", "evidence"):
+                            if not getattr(survivor, field, None) and getattr(other, field, None):
+                                setattr(survivor, field, getattr(other, field))
+                        await session.delete(other)
+                        loser_ids.add((model, other.id))
+                    target_map[(model, survivor.id)] = final_target
+
+                for row_id, target_id in planned.items():
+                    if (model, row_id) in loser_ids:
+                        continue
+                    target_map.setdefault((model, row_id), target_id)
+
+            # Critical ordering: remove collision losers before assigning the unique target IDs.
+            await session.flush()
+            for (model, row_id), target_id in target_map.items():
+                if (model, row_id) in loser_ids:
+                    continue
+                row = rows_by_id[(model, row_id)]
+                if row.target_mod_id != target_id:
+                    row.target_mod_id = target_id
             await session.commit()
 
     async def _find_existing_mod(self, session, source_url=None, asset_id=None, mod_db_id=None, mod_id=None):

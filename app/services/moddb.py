@@ -342,6 +342,39 @@ class ModDBClient:
         response.raise_for_status()
         return response.json()
 
+    async def get_latest_release(self, mod_db_id: int, identifier: str | None = None) -> dict[str, Any]:
+        """Return the newest downloadable release even when it is not tagged for a target game version.
+
+        Build creation only uses this after compatibility inspection has warned the user and the
+        user chooses to continue. Unlike install-information?gv=..., this endpoint does not filter
+        the release out solely because Mod DB lacks a game-version tag.
+        """
+        if not isinstance(mod_db_id, int) or mod_db_id <= 0:
+            return {}
+        client = await self._get_client()
+        params: dict[str, str] = {}
+        if identifier and str(identifier).strip():
+            params["identifier"] = str(identifier).strip()
+        response = await client.get(
+            f"{self.api_base}/v2/mods/{mod_db_id}/releases/latest",
+            params=params,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        if not isinstance(payload, dict):
+            return {}
+        # Current V2 docs show the release object directly. Accept a wrapped response too, in
+        # case the endpoint's response envelope changes while V2 remains under development.
+        if isinstance(payload.get("data"), dict):
+            data = payload["data"]
+            if _first_nonempty(data, "fileUrl", "fileurl", "file_url"):
+                return data
+            if identifier:
+                candidate = data.get(identifier) or data.get(identifier.casefold())
+                if isinstance(candidate, dict):
+                    return candidate
+        return payload
+
     def _page_from_identity(self, asset_id: int | None, mod_id: str | None) -> str:
         if asset_id is not None:
             return f"{self.site_base}/show/mod/{asset_id}"
@@ -574,3 +607,11 @@ def _source_identity(source_url: str | None) -> tuple[int | None, str | None]:
     if re.fullmatch(r"/[A-Za-z0-9][A-Za-z0-9._-]{1,119}", path):
         return None, path[1:]
     return None, None
+
+
+def _first_nonempty(data: dict[str, Any], *keys: str) -> Any:
+    for key in keys:
+        value = data.get(key)
+        if value is not None and str(value).strip():
+            return value
+    return None

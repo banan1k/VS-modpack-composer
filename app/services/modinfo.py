@@ -4,6 +4,8 @@ import json
 import zipfile
 from pathlib import Path
 
+from .identity import CORE_MOD_IDS
+
 
 def read_modinfo(path: Path) -> dict:
     """Read the nearest modinfo.json from a Vintage Story mod archive."""
@@ -19,13 +21,16 @@ def read_modinfo(path: Path) -> dict:
     return payload
 
 
-def read_dependencies(path: Path) -> dict[str, str]:
-    data = read_modinfo(path)
+def dependencies_from_modinfo(data: dict) -> dict[str, str]:
     deps = data.get("dependencies")
     if not isinstance(deps, dict):
         return {}
     return {
         str(key).strip(): str(value or "").strip()
         for key, value in deps.items()
-        if str(key).strip() and str(key).casefold() != "game"
+        if str(key).strip() and str(key).strip().casefold() not in CORE_MOD_IDS
     }
+
+
+def read_dependencies(path: Path) -> dict[str, str]:
+    return dependencies_from_modinfo(read_modinfo(path))

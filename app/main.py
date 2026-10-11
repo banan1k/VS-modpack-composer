@@ -12,10 +12,11 @@ from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import select
+from sqlalchemy.orm import selectinload
 
 from .config import settings
 from .db import SessionLocal, init_db
-from .models import Addon, Build, BuildMod, Compatibility, Dependency, Mod, ModRelease
+from .models import Addon, Build, BuildMod, Compatibility, Dependency, DependencyRequest, Mod, ModRelease, DiscordSource
 from .services.builds import BuildService
 from .services.cache import CacheManager
 from .services.discord_ingest import DiscordCatalogScanner
@@ -63,6 +64,8 @@ discord_task: asyncio.Task | None = None
 @bot.event
 async def on_ready():
     logger.info("[Discord] Connected as %s (guilds: %s)", bot.user, len(bot.guilds))
+    # Deliver durable dependency requests created during startup, without rerunning every ZIP.
+    asyncio.create_task(prefetch.flush_open_dependency_requests(), name="flush-dependency-requests")
 
 
 jobs = JobManager()
@@ -80,7 +83,7 @@ cache = CacheManager(
     settings.download_concurrency,
 )
 priority = PriorityCoordinator()
-prefetch = PrefetchManager(cache, moddb, priority)
+prefetch = PrefetchManager(cache, moddb, priority, discord_client=bot)
 builds = BuildService(cache, moddb, priority)
 
 
@@ -118,6 +121,7 @@ async def _start_discord():
 async def startup():
     global discord_task
     await init_db()
+    await cache.migrate_cache_layout()
     prefetch.start()
     if settings.discord_token:
         discord_task = asyncio.create_task(_start_discord())
@@ -277,20 +281,25 @@ async def create_build(data: BuildCreate):
 @app.get("/api/builds/{share_id}")
 async def get_build(share_id: str):
     async with SessionLocal() as session:
-        build = (
-            await session.execute(select(Build).where(Build.share_id == share_id))
-        ).scalar_one_or_none()
+        build_id = (await session.execute(
+            select(Build.id).where(Build.share_id == share_id)
+        )).scalar_one_or_none()
+    # Don't keep a read session open during a Discord network request/recovery write.
+    if build_id is None:
+        await _recover_build_from_discord(share_id)
+    async with SessionLocal() as session:
+        build = (await session.execute(
+            select(Build).where(Build.share_id == share_id)
+        )).scalar_one_or_none()
         if not build:
-            raise HTTPException(404)
-        items = (
-            await session.execute(
-                select(BuildMod, Mod, ModRelease)
-                .join(Mod, Mod.id == BuildMod.mod_id)
-                .outerjoin(ModRelease, ModRelease.id == BuildMod.release_id)
-                .where(BuildMod.build_id == build.id)
-                .order_by(BuildMod.position)
-            )
-        ).all()
+            raise HTTPException(404, "Сборка не найдена локально и не удалось восстановить её из Discord.")
+        items = (await session.execute(
+            select(BuildMod, Mod, ModRelease)
+            .join(Mod, Mod.id == BuildMod.mod_id)
+            .outerjoin(ModRelease, ModRelease.id == BuildMod.release_id)
+            .where(BuildMod.build_id == build.id)
+            .order_by(BuildMod.position)
+        )).all()
         return {
             "share_id": share_id,
             "name": build.name,
@@ -359,16 +368,38 @@ async def publish_build(share_id: str, data: BuildPublish):
         except Exception as exc:  # noqa: BLE001
             logger.warning("[Discord] duplicate-publish recovery check failed for %s: %s", share_id, exc)
 
-        modpack_lines = [
-            f"Название: {build_name}",
-            f"Vintage Story: {target_version or 'не указана'}",
-            f"Share ID: {share_id}",
-            f"Ссылка: {url}",
-            "",
-            "Моды:",
-        ]
-        modpack_lines.extend(f"{idx}. {name}" for idx, name in enumerate(mod_names, 1))
-        modpack_bytes = "\n".join(modpack_lines).encode("utf-8")
+        # Publish a single machine-readable manifest. Historical messages that contain modpack.txt
+        # remain recoverable, but new posts no longer clutter the builds channel with text files.
+        async with SessionLocal() as session:
+            manifest_rows = (await session.execute(
+                select(BuildMod, Mod, ModRelease)
+                .join(Mod, Mod.id == BuildMod.mod_id)
+                .outerjoin(ModRelease, ModRelease.id == BuildMod.release_id)
+                .where(BuildMod.build_id == build.id)
+                .order_by(BuildMod.position)
+            )).all()
+            manifest_mods = [
+                {
+                    "name": mod.name,
+                    "mod_id": mod.mod_id,
+                    "canonical_id": mod.canonical_id,
+                    "mod_db_url": mod.mod_db_url,
+                    "mod_db_asset_id": mod.mod_db_asset_id,
+                    "mod_db_id": mod.mod_db_id,
+                    "selected_version": bm.selected_version or (release.mod_version if release else None),
+                    "filename": bm.selected_file_name or (release.filename if release else None) or mod.latest_file_name,
+                    "selected_file_url": bm.selected_file_url or (release.file_url if release else None) or mod.latest_file_url,
+                }
+                for bm, mod, release in manifest_rows
+            ]
+        manifest_payload = {
+            "schema_version": 2,
+            "share_id": share_id,
+            "name": build_name,
+            "target_game_version": target_version,
+            "mods": manifest_mods,
+        }
+        modpack_json_bytes = json.dumps(manifest_payload, ensure_ascii=False, indent=2).encode("utf-8")
 
         embed = discord.Embed(
             title=f"📦 {build_name}",
@@ -382,10 +413,10 @@ async def publish_build(share_id: str, data: BuildPublish):
         embed.add_field(name="Vintage Story", value=target_version or "Не указана", inline=True)
         embed.add_field(name="Модов", value=str(len(mod_names)), inline=True)
         embed.add_field(name="Share ID", value=f"`{share_id}`", inline=True)
-        embed.add_field(name="Состав", value="Полный список прикреплён отдельным файлом `modpack.txt`.", inline=False)
-        embed.set_footer(text="modpack.txt содержит полный список модов; ссылка ведёт на страницу сборки")
-        discord_file = discord.File(io.BytesIO(modpack_bytes), filename="modpack.txt")
-        msg = await channel.send(embed=embed, file=discord_file)
+        embed.add_field(name="Состав", value="Полный состав и выбранные версии находятся в приложенном `modpack.json`.", inline=False)
+        embed.set_footer(text="modpack.json позволяет восстановить состав сборки")
+        discord_files = [discord.File(io.BytesIO(modpack_json_bytes), filename="modpack.json")]
+        msg = await channel.send(embed=embed, files=discord_files)
 
         async with SessionLocal() as session:
             build = (await session.execute(select(Build).where(Build.share_id == share_id))).scalar_one()
@@ -400,6 +431,165 @@ async def build_page(share_id: str):
     return FileResponse(Path(__file__).parent / "web" / "index.html")
 
 
+async def _recover_build_from_discord(share_id: str) -> bool:
+    """Restore a build from its Discord attachment if its local Build row is absent.
+
+    `modpack.json` is authoritative for current posts. For older posts, parse the historical
+    `modpack.txt` file, then match names against the local catalog. Recovery is conservative:
+    if even one mod cannot be mapped, don't silently create an incomplete build.
+    """
+    async with SessionLocal() as session:
+        existing = (await session.execute(select(Build.id).where(Build.share_id == share_id))).scalar_one_or_none()
+        if existing:
+            return True
+    if not bot.is_ready() or not settings.discord_builds_channel_id:
+        return False
+    channel = bot.get_channel(settings.discord_builds_channel_id)
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(settings.discord_builds_channel_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[BUILD] legacy recovery cannot access Discord builds channel: %s", exc)
+            return False
+    if not hasattr(channel, "history"):
+        return False
+
+    expected_suffix = f"/build/{share_id}"
+    matched_message = None
+    try:
+        async for message in channel.history(limit=1000, oldest_first=False):
+            hit = share_id in (message.content or "")
+            if not hit:
+                hit = any(
+                    str(embed.url or "").rstrip("/").endswith(expected_suffix)
+                    or share_id in str(embed.title or "")
+                    or share_id in str(embed.description or "")
+                    or any(share_id in str(field.value or "") for field in embed.fields)
+                    for embed in message.embeds
+                )
+            if hit:
+                matched_message = message
+                break
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[BUILD] legacy recovery could not scan Discord messages: %s", exc)
+        return False
+    if not matched_message:
+        return False
+
+    manifest = None
+    text_attachment = None
+    for attachment in matched_message.attachments:
+        try:
+            if attachment.filename.casefold() == "modpack.json":
+                manifest = json.loads((await attachment.read()).decode("utf-8-sig"))
+            elif attachment.filename.casefold() == "modpack.txt":
+                text_attachment = (await attachment.read()).decode("utf-8-sig", errors="replace")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[BUILD] could not read manifest attachment %s: %s", attachment.filename, exc)
+
+    if not isinstance(manifest, dict) or not isinstance(manifest.get("mods"), list):
+        manifest = _legacy_text_manifest(text_attachment or matched_message.content or "", share_id)
+    if not isinstance(manifest, dict) or not isinstance(manifest.get("mods"), list) or not manifest["mods"]:
+        logger.warning("[BUILD] no compatible manifest attached to old Discord build share_id=%s", share_id)
+        return False
+
+    from .services.identity import canonical_identifier
+    from .services.builds import _release_for_game
+    target_version = manifest.get("target_game_version") or manifest.get("vintage_story_version")
+    name = str(manifest.get("name") or "Vintage Story Modpack")[:160]
+    async with SessionLocal() as session:
+        # Include hidden legacy dependency rows only for exact recovery of historical manifests.
+        # They remain excluded from normal catalog/search and can never be selected in new builds.
+        catalog = (await session.execute(
+            select(Mod).options(selectinload(Mod.releases)).order_by(Mod.catalog_visible.desc(), Mod.id)
+        )).scalars().all()
+        source_rows = (await session.execute(select(DiscordSource))).scalars().all()
+        title_to_mod: dict[str, int] = {}
+        for source in source_rows:
+            if source.mod_id and source.post_title:
+                title_to_mod.setdefault(canonical_identifier(source.post_title), source.mod_id)
+        resolved = []
+        unresolved = []
+        for entry in manifest["mods"]:
+            if isinstance(entry, str):
+                entry = {"name": entry}
+            if not isinstance(entry, dict):
+                unresolved.append(str(entry)); continue
+            target = None
+            url = str(entry.get("mod_db_url") or "").rstrip("/").casefold()
+            asset = entry.get("mod_db_asset_id")
+            mod_identifier = str(entry.get("mod_id") or "").casefold()
+            canon_id = canonical_identifier(entry.get("canonical_id") or "")
+            name_key = canonical_identifier(entry.get("name") or "")
+            # Exact page/asset first, then real modinfo identifier, explicit Discord title, name.
+            target = next((m for m in catalog if url and str(m.mod_db_url or "").rstrip("/").casefold() == url), None)
+            if target is None and asset is not None:
+                target = next((m for m in catalog if m.mod_db_asset_id == asset), None)
+            if target is None and mod_identifier:
+                target = next((m for m in catalog if str(m.mod_id or "").casefold() == mod_identifier), None)
+            alias_key = canon_id or name_key
+            if target is None and alias_key:
+                alias_id = title_to_mod.get(alias_key)
+                target = next((m for m in catalog if m.id == alias_id), None) if alias_id else None
+                if target is None:
+                    target = next((m for m in catalog if canonical_identifier(m.name) == alias_key), None)
+            if target is None:
+                unresolved.append(str(entry.get("name") or entry.get("mod_id") or "unknown mod"))
+                continue
+            release = next((r for r in target.releases if entry.get("selected_version") and r.mod_version == entry.get("selected_version")), None)
+            if release is None:
+                release = _release_for_game(target.releases, target_version)
+            resolved.append((target, release, entry))
+
+        if unresolved:
+            logger.warning("[BUILD] legacy recovery refused partial build %s; unmatched mods: %s", share_id, unresolved[:20])
+            return False
+        # If a row with this share ID appeared while reading the manifest, leave it intact.
+        build = (await session.execute(select(Build).where(Build.share_id == share_id))).scalar_one_or_none()
+        if build:
+            return True
+        build = Build(
+            share_id=share_id,
+            name=name,
+            target_game_version=target_version,
+            published=True,
+            discord_message_id=matched_message.id,
+            schema_version=1,
+        )
+        session.add(build)
+        await session.flush()
+        for pos, (mod, release, entry) in enumerate(resolved):
+            session.add(BuildMod(
+                build_id=build.id,
+                mod_id=mod.id,
+                release_id=release.id if release else None,
+                selected_version=(entry.get("selected_version") or (release.mod_version if release else None)),
+                selected_file_url=(entry.get("selected_file_url") or entry.get("file_url")),
+                selected_file_name=(entry.get("filename") or entry.get("selected_file_name")),
+                auto_added=False,
+                position=pos,
+            ))
+        await session.commit()
+    logger.info("[BUILD] restored old share ID from Discord: %s (%s mods)", share_id, len(resolved))
+    return True
+
+
+def _legacy_text_manifest(text: str, share_id: str) -> dict:
+    import re
+    name = "Vintage Story Modpack"
+    target_version = None
+    mods = []
+    for line in text.splitlines():
+        line = line.strip()
+        if line.lower().startswith("название:") or line.lower().startswith("name:"):
+            name = line.split(":", 1)[1].strip() or name
+        elif line.lower().startswith("vintage story:"):
+            target_version = line.split(":", 1)[1].strip() or None
+        elif re.match(r"^\d+[.)]\s+", line):
+            mods.append({"name": re.sub(r"^\d+[.)]\s+", "", line).strip()})
+    return {"schema_version": 0, "share_id": share_id, "name": name, "target_game_version": target_version, "mods": mods}
+
+
 @app.get("/media/images/{mod_id}", include_in_schema=False)
 async def media_image(mod_id: int):
     async with SessionLocal() as session:
@@ -411,6 +601,10 @@ async def media_image(mod_id: int):
 
 @app.post("/api/builds/{share_id}/prepare")
 async def prepare_build(share_id: str):
+    async with SessionLocal() as session:
+        exists = (await session.execute(select(Build.id).where(Build.share_id == share_id))).scalar_one_or_none()
+    if not exists:
+        await _recover_build_from_discord(share_id)
     async def worker(job_id, jm):
         async def progress(current, total, message):
             await jm.update(job_id, current=current, total=total, message=message)
@@ -430,6 +624,10 @@ async def prepare_build(share_id: str):
 
 @app.get("/api/builds/{share_id}/download")
 async def download_build(share_id: str, background_tasks: BackgroundTasks):
+    async with SessionLocal() as session:
+        exists = (await session.execute(select(Build.id).where(Build.share_id == share_id))).scalar_one_or_none()
+    if not exists:
+        await _recover_build_from_discord(share_id)
     temp_path, filename = await builds.build_temp_archive(share_id)
     background_tasks.add_task(_delete_temp_file, temp_path)
     return FileResponse(temp_path, media_type="application/zip", filename=filename, background=background_tasks)
