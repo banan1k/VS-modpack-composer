@@ -142,6 +142,10 @@ def extract_relationships(html: str, known_mods: list[dict]) -> list[RelationCan
 
     candidates: list[RelationCandidate] = []
     seen: set[tuple[str, str | None, str | None]] = set()
+    # Keep track of links already handled as part of a semantic paragraph/list item.
+    # Mod DB has several descriptions where linked mods are instead direct children of
+    # generic div/span wrappers, which the old parser silently skipped.
+    seen_urls: set[str] = set()
     active_section: str | None = None
     changelog_level: int | None = None
     started = title_heading is None
@@ -182,6 +186,42 @@ def extract_relationships(html: str, known_mods: list[dict]) -> list[RelationCan
             continue
 
         if node.name not in {"p", "li", "dt", "dd", "blockquote"}:
+            # Fallback: process Mod DB links that aren't wrapped in semantic text blocks.
+            # This is common for descriptions built from div/span rows (for example A Culinary
+            # Artillery's "Expanded Foods Suite") and for dedicated recommendation sections.
+            if node.name == "a" and node.get("href"):
+                href = urljoin("https://mods.vintagestory.at", str(node.get("href")))
+                url = _canonical_url(href)
+                if _is_mod_page_url(href) and url not in seen_urls:
+                    context_text = _anchor_context(node, description_root)
+                    text = context_text or node.get_text(" ", strip=True)
+                    if text and not _looks_like_download_block(text) and not _looks_like_release_text(text):
+                        matches = _find_keyword_matches(text)
+                        relation_kind = _classify_relation(matches, active_section, text.casefold())
+                        if relation_kind is None:
+                            relation_kind = active_section or "optional_dependency"
+                        target_name = node.get_text(" ", strip=True) or _mod_name_from_url(url)
+                        known = _match_known(target_name, url, known_by_name, known_by_id, known_by_url)
+                        if matches:
+                            confidence = 0.97 if known else 0.92
+                        elif active_section is not None:
+                            confidence = 0.96
+                        elif normalize_name(text) != normalize_name(target_name):
+                            confidence = 0.76
+                        else:
+                            confidence = 0.70
+                        key = (relation_kind, url, normalize_name(target_name or ""))
+                        if key not in seen:
+                            seen.add(key)
+                            candidates.append(RelationCandidate(
+                                relation_kind,
+                                url,
+                                known.get("name") if known else target_name,
+                                _relation_phrase(matches, active_section) or "unlabelled Mod DB link",
+                                text[:1000],
+                                confidence,
+                            ))
+                        seen_urls.add(url)
             continue
         if any(isinstance(c, Tag) and c.name in {"p", "li", "dt", "dd", "blockquote"} for c in node.children):
             continue
@@ -225,6 +265,7 @@ def extract_relationships(html: str, known_mods: list[dict]) -> list[RelationCan
                 if key in seen:
                     continue
                 seen.add(key)
+                seen_urls.add(url)
                 candidates.append(
                     RelationCandidate(
                         relation_kind,
@@ -262,7 +303,114 @@ def extract_relationships(html: str, known_mods: list[dict]) -> list[RelationCan
             )
         )
 
+    # Some Mod DB skins render headings such as "Recommended mod combination" outside
+    # #tab-description. Only parse links while inside an explicitly recognized relation section;
+    # this avoids treating the page header, author links or other chrome as recommendations.
+    candidates.extend(
+        _extract_external_relation_sections(
+            soup, description_root, known_by_name, known_by_id, known_by_url, seen_urls
+        )
+    )
+    return _dedupe_relation_candidates(candidates)
+
+
+def _anchor_context(anchor: Tag, root: Tag) -> str:
+    """Return nearby text for a link, preferring a paragraph/list item when available."""
+    label = anchor.get_text(" ", strip=True)
+    best = label
+    semantic = {"p", "li", "dt", "dd", "blockquote"}
+    parent = anchor.parent
+    while isinstance(parent, Tag) and parent is not root:
+        text = " ".join(parent.stripped_strings).strip()
+        if not text:
+            parent = parent.parent
+            continue
+        if parent.name in semantic:
+            return text
+        mod_links = [
+            a for a in parent.find_all("a", href=True)
+            if _is_mod_page_url(urljoin("https://mods.vintagestory.at", str(a.get("href"))))
+        ]
+        if len(mod_links) <= 1 and normalize_name(text) != normalize_name(label):
+            return text
+        if len(mod_links) <= 1 and text:
+            best = text
+        parent = parent.parent
+    return best
+
+
+def _extract_external_relation_sections(soup, description_root, by_name, by_id, by_url, seen_urls):
+    """Extract linked mods from explicit recommendation/compatibility sections outside the description tab."""
+    inside = {description_root, *description_root.find_all(True)}
+    candidates: list[RelationCandidate] = []
+    active_section: str | None = None
+    changelog_level: int | None = None
+    for node in soup.find_all(True):
+        if node in inside:
+            continue
+        if _is_commentish(node) or node.name in {"script", "style", "noscript", "template", "nav", "footer", "form", "table", "pre", "code"}:
+            if _is_commentish(node) or node.name == "table":
+                active_section = None
+                changelog_level = None
+            continue
+        if re.fullmatch(r"h[2-6]", node.name or ""):
+            heading = " ".join(node.stripped_strings).strip()
+            level = int(node.name[1])
+            if _is_comments_heading(heading):
+                active_section = None
+                changelog_level = None
+                continue
+            if changelog_level is not None and level <= changelog_level:
+                changelog_level = None
+            if _looks_like_changelog_heading(heading) or normalize_name(heading) in {"changelog", "changes", "version history"}:
+                changelog_level = level
+                active_section = None
+                continue
+            if changelog_level is not None:
+                continue
+            active_section = _section_relation(heading)
+            continue
+        if changelog_level is not None or not active_section or node.name != "a" or not node.get("href"):
+            continue
+        href = urljoin("https://mods.vintagestory.at", str(node.get("href")))
+        url = _canonical_url(href)
+        if not _is_mod_page_url(href) or url in seen_urls:
+            continue
+        context_text = _anchor_context(node, soup)
+        text = context_text or node.get_text(" ", strip=True)
+        matches = _find_keyword_matches(text)
+        relation_kind = _classify_relation(matches, active_section, text.casefold()) or active_section
+        if not relation_kind:
+            continue
+        target_name = node.get_text(" ", strip=True) or _mod_name_from_url(url)
+        known = _match_known(target_name, url, by_name, by_id, by_url)
+        confidence = 0.97 if (matches and known) else 0.92 if matches else 0.96
+        candidates.append(RelationCandidate(
+            relation_kind,
+            url,
+            known.get("name") if known else target_name,
+            _relation_phrase(matches, active_section) or active_section,
+            text[:1000],
+            confidence,
+        ))
+        seen_urls.add(url)
     return candidates
+
+
+def _dedupe_relation_candidates(candidates: list[RelationCandidate]) -> list[RelationCandidate]:
+    merged: dict[tuple[str, str | None, str | None], RelationCandidate] = {}
+    for candidate in candidates:
+        key = (
+            candidate.relation_type,
+            _canonical_url(candidate.url) if candidate.url else None,
+            normalize_name(candidate.target_name or "") if not candidate.url else None,
+        )
+        prior = merged.get(key)
+        if prior is None or candidate.confidence > prior.confidence:
+            merged[key] = candidate
+        elif not prior.evidence and candidate.evidence:
+            prior.evidence = candidate.evidence
+    return list(merged.values())
 
 
 def _page_title(soup: BeautifulSoup) -> str | None:

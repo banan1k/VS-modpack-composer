@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+import json
 
 
 def normalize_tag_names(values: Iterable[object] | None) -> list[str]:
@@ -15,6 +16,11 @@ def normalize_tag_names(values: Iterable[object] | None) -> list[str]:
             continue
         unique.setdefault(name.casefold(), name)
     return sorted(unique.values(), key=lambda value: (value.casefold(), value))
+
+
+def tag_names_json(values: Iterable[object] | None) -> str:
+    """Serialize normalized forum-tag names for storage on catalog and addon rows."""
+    return json.dumps(normalize_tag_names(values), ensure_ascii=False)
 
 
 def preserved_forum_tag_ids(source_tags: Iterable[object], target_tags: Iterable[object]) -> list[int | None]:

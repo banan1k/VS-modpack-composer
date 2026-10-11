@@ -20,7 +20,7 @@ from .moddb import ModDBClient, ModDBData
 from .parser import extract_api_relationships, extract_relationships, normalize_name
 from .identity import canonical_identifier
 from .versioning import latest_game_version, version_key
-from .tags import normalize_tag_names, tag_lists_match
+from .tags import normalize_tag_names, tag_lists_match, tag_names_json
 
 logger = logging.getLogger(__name__)
 
@@ -161,6 +161,15 @@ class CatalogSyncService:
                     main_data.notes.append(f"HTML relation parse error: {type(exc).__name__}: {exc}")
                     logger.exception("[PARSER] relation parse failed source=%s", rec.mod_db_url)
             relation_rows = _merge_relations(relation_rows)
+            relation_types = {}
+            for row in relation_rows:
+                relation_types[row.relation_type] = relation_types.get(row.relation_type, 0) + 1
+            logger.info(
+                "[PARSER] extracted relations source=%s count=%s types=%s",
+                rec.mod_db_url,
+                len(relation_rows),
+                dict(sorted(relation_types.items())),
+            )
             image_path = await self._fetch_image(main_data)
 
             addon_prepared = []
@@ -339,6 +348,9 @@ class CatalogSyncService:
                     await session.flush()
                 self._apply_mod_data(child, addon_data, addon_image, origin="addon", parent_mod_id=mod.id, catalog_visible=True)
                 child.canonical_id = canonical_identifier(addon.get("title") or addon_data.name)
+                # Discord forum tags belong to the thread starter, not individual replies.
+                # Every mod discovered in a reply inherits the starter topic's tags.
+                _apply_inherited_forum_tags(child, rec.tags)
                 child_release_rows = await self._replace_releases(session, child, addon_data.releases)
                 self._recompute_latest(child, child_release_rows)
                 session.add(Addon(
@@ -728,6 +740,11 @@ def _parse_dt(value):
         return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
     except ValueError:
         return None
+
+
+def _apply_inherited_forum_tags(mod: Mod, tags) -> None:
+    """Apply the forum starter's tags to a mod cataloged from a reply in the same thread."""
+    mod.tags_json = tag_names_json(tags)
 
 
 def _source_fingerprint(raw_hash: str) -> str:

@@ -4,6 +4,7 @@ import asyncio
 import io
 import json
 import logging
+import re
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
@@ -21,6 +22,11 @@ from .models import Addon, Build, BuildMod, Compatibility, Dependency, Dependenc
 from .services.builds import BuildService
 from .services.cache import CacheManager
 from .services.discord_ingest import DiscordCatalogScanner
+from .services.catalog_requests import (
+    catalog_request_key as _catalog_request_key,
+    find_catalog_mod as _find_catalog_mod,
+    is_moddb_page_url as _is_moddb_page_url,
+)
 from .services.jobs import JobManager
 from .services.moddb import ModDBClient
 from .services.prefetch import PrefetchManager
@@ -228,6 +234,13 @@ class BuildPublish(BaseModel):
     publish: bool
 
 
+class CatalogRequestCreate(BaseModel):
+    target_name: str = Field(min_length=1, max_length=300)
+    target_url: str = Field(min_length=8, max_length=1000)
+    source_mod_id: int
+    relation_type: str = Field(min_length=1, max_length=40)
+
+
 app = FastAPI(title=settings.app_name)
 
 
@@ -325,6 +338,9 @@ async def catalog():
 @app.get("/api/mods/{mod_id}/relations")
 async def relations(mod_id: int):
     async with SessionLocal() as session:
+        source = await session.get(Mod, mod_id)
+        if source is None or not source.catalog_visible:
+            raise HTTPException(404, "Мод не найден в каталоге")
         deps = (
             await session.execute(select(Dependency).where(Dependency.mod_id == mod_id))
         ).scalars().all()
@@ -344,25 +360,131 @@ async def relations(mod_id: int):
                     await session.execute(select(Mod).where(Mod.id.in_(target_ids)))
                 ).scalars().all()
             }
+        catalog_mods = (
+            await session.execute(select(Mod).where(Mod.catalog_visible.is_(True)))
+        ).scalars().all()
         return {
-            "dependencies": [serialize_relation(x, targets) for x in deps],
-            "compatibility": [serialize_relation(x, targets) for x in comps],
+            "source_mod_id": source.id,
+            "source_mod_name": source.name,
+            "dependencies": [serialize_relation(x, targets, catalog_mods) for x in deps],
+            "compatibility": [serialize_relation(x, targets, catalog_mods) for x in comps],
             "addons": [
-                {
-                    "relation_type": "addon",
-                    "target_mod_id": a.addon_mod_id,
-                    "target_name": targets.get(a.addon_mod_id).name if a.addon_mod_id and a.addon_mod_id in targets else a.title,
-                    "target_url": targets.get(a.addon_mod_id).mod_db_url if a.addon_mod_id and a.addon_mod_id in targets else a.url,
-                    "confidence": 1.0,
-                    "verified": True,
-                    "evidence": "Discord thread",
-                    "raw_phrase": "addon",
-                    "source_kind": "discord",
-                    "required_version": None,
-                }
+                _serialize_addon_relation(a, targets, catalog_mods)
                 for a in addons
             ],
         }
+
+
+@app.post("/api/catalog-requests")
+async def create_catalog_request(data: CatalogRequestCreate):
+    """Ask the configured #mod-registry channel to add a missing relation target."""
+    if data.relation_type not in {
+        "compatible", "incompatible", "optional_dependency", "addon", "required_by"
+    }:
+        raise HTTPException(400, "Неподдерживаемый тип связи")
+    target_name = data.target_name.strip()
+    if not target_name:
+        raise HTTPException(400, "Название мода не может быть пустым")
+    if not _is_moddb_page_url(data.target_url):
+        raise HTTPException(400, "Ожидается ссылка на страницу мода Vintage Story Mod DB")
+    if not settings.discord_registry_channel_id:
+        raise HTTPException(503, "DISCORD_REGISTRY_CHANNEL_ID не настроен в .env")
+    if not bot.is_ready():
+        raise HTTPException(503, "Discord-бот ещё не подключён")
+
+    channel = bot.get_channel(settings.discord_registry_channel_id)
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(settings.discord_registry_channel_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[CATALOG REQUEST] cannot open registry channel: %s", exc)
+            raise HTTPException(503, "Не удалось открыть канал #mod-registry") from exc
+    if not callable(getattr(channel, "send", None)):
+        raise HTTPException(503, "DISCORD_REGISTRY_CHANNEL_ID должен указывать на текстовый канал")
+
+    request_key = _catalog_request_key(data.target_url)
+    async with SessionLocal() as session:
+        source = await session.get(Mod, data.source_mod_id)
+        if source is None or not source.catalog_visible:
+            raise HTTPException(404, "Исходный мод не найден в каталоге")
+        catalog_mods = (
+            await session.execute(select(Mod).where(Mod.catalog_visible.is_(True)))
+        ).scalars().all()
+        matched = _find_catalog_mod(target_name, data.target_url, None, catalog_mods)
+        if matched:
+            raise HTTPException(
+                409,
+                detail={"code": "already_in_catalog", "message": "Этот мод уже есть в каталоге"},
+            )
+
+        request = (
+            await session.execute(
+                select(DependencyRequest).where(DependencyRequest.mod_identifier == request_key)
+            )
+        ).scalars().first()
+        if request and request.discord_message_id:
+            return {"status": "already_requested", "message_id": request.discord_message_id}
+        if request and request.status == "sending":
+            return {"status": "already_requested", "pending": True}
+        if request is None:
+            request = DependencyRequest(
+                mod_identifier=request_key,
+                requested_name=target_name,
+                target_url=data.target_url,
+                required_by_json=json.dumps(
+                    [{"name": source.name, "version": data.relation_type}], ensure_ascii=False
+                ),
+                status="sending",
+            )
+            session.add(request)
+            await session.flush()
+        else:
+            request.requested_name = target_name
+            request.target_url = data.target_url
+            request.required_by_json = json.dumps(
+                [{"name": source.name, "version": data.relation_type}], ensure_ascii=False
+            )
+            request.status = "sending"
+        request_id = request.id
+        source_name = source.name
+        await session.commit()
+
+    relation_label = {
+        "compatible": "совместимость",
+        "incompatible": "конфликт",
+        "optional_dependency": "рекомендация",
+        "addon": "дополнение",
+        "required_by": "используется в связях других модов",
+    }[data.relation_type]
+    content = (
+        f"📥 **Запрос на добавление мода в каталог**\n"
+        f"Мод: **[{target_name}]({data.target_url})**\n"
+        f"Найден в разделе «Совместимости» мода: **{source_name}**\n"
+        f"Тип связи: {relation_label}\n\n"
+        "Если запрос актуален, добавьте тему с этим модом в один из настроенных форумов каталога."
+    )
+    try:
+        discord_message = await channel.send(content[:1900])
+    except Exception as exc:  # noqa: BLE001
+        async with SessionLocal() as session:
+            request = await session.get(DependencyRequest, request_id)
+            if request:
+                request.status = "failed"
+                await session.commit()
+        logger.exception("[CATALOG REQUEST] Discord message failed for %s", target_name)
+        raise HTTPException(502, "Не удалось отправить запрос в #mod-registry") from exc
+
+    async with SessionLocal() as session:
+        request = await session.get(DependencyRequest, request_id)
+        if request:
+            request.discord_message_id = discord_message.id
+            request.status = "submitted"
+            await session.commit()
+    logger.info(
+        "[CATALOG REQUEST] submitted: target=%s source=%s message_id=%s",
+        target_name, source_name, discord_message.id,
+    )
+    return {"status": "submitted", "message_id": discord_message.id}
 
 
 @app.post("/api/sync", response_model=SyncResponse)
@@ -728,7 +850,6 @@ async def _recover_build_from_discord(share_id: str) -> bool:
 
 
 def _legacy_text_manifest(text: str, share_id: str) -> dict:
-    import re
     name = "Vintage Story Modpack"
     target_version = None
     mods = []
@@ -835,17 +956,44 @@ def serialize_mod(m: Mod, latest_mod_version: str | None = None):
     }
 
 
-def serialize_relation(r, targets):
+
+def serialize_relation(r, targets, catalog_mods=()):
     target = targets.get(r.target_mod_id) if r.target_mod_id else None
+    target_name = target.name if target else r.target_name
+    target_url = target.mod_db_url if target and target.mod_db_url else getattr(r, "target_url", None)
+    catalog_match = _find_catalog_mod(target_name, target_url, r.target_mod_id, catalog_mods)
     return {
         "relation_type": r.relation_type,
         "target_mod_id": r.target_mod_id,
-        "target_name": target.name if target else r.target_name,
-        "target_url": target.mod_db_url if target else getattr(r, "target_url", None),
+        "target_name": target_name,
+        "target_url": target_url,
+        "in_catalog": bool(catalog_match),
+        "catalog_mod_id": catalog_match.id if catalog_match else None,
         "confidence": r.confidence,
         "verified": r.verified,
         "evidence": r.evidence,
         "raw_phrase": r.raw_phrase,
         "source_kind": getattr(r, "source_kind", "html"),
         "required_version": getattr(r, "required_version", None),
+    }
+
+
+def _serialize_addon_relation(a, targets, catalog_mods):
+    target = targets.get(a.addon_mod_id) if a.addon_mod_id else None
+    target_name = target.name if target else a.title
+    target_url = target.mod_db_url if target and target.mod_db_url else a.url
+    catalog_match = _find_catalog_mod(target_name, target_url, a.addon_mod_id, catalog_mods)
+    return {
+        "relation_type": "addon",
+        "target_mod_id": a.addon_mod_id,
+        "target_name": target_name,
+        "target_url": target_url,
+        "in_catalog": bool(catalog_match),
+        "catalog_mod_id": catalog_match.id if catalog_match else None,
+        "confidence": 1.0,
+        "verified": True,
+        "evidence": "Discord thread",
+        "raw_phrase": "addon",
+        "source_kind": "discord",
+        "required_version": None,
     }

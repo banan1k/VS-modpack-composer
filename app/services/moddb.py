@@ -51,7 +51,7 @@ class ModDBClient:
                     self._client = httpx.AsyncClient(
                         timeout=self.timeout,
                         follow_redirects=True,
-                        headers={"User-Agent": "VS-Modpack-Builder/0.5"},
+                        headers={"User-Agent": "VS-Modpack-Builder/0.5.3"},
                     )
         return self._client
 

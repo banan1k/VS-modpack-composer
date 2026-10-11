@@ -21,7 +21,7 @@ class Settings(BaseSettings):
     relation_min_confidence: float = 0.90
     max_vintage_story_version: str = "1.22.7"
     prefetch_concurrency: int = 2
-    catalog_source_version: str = "16"
+    catalog_source_version: str = "17"
     auto_library_modids: str = "imgui,libgui,musicvolumebalancer"
 
     discord_token: str | None = None

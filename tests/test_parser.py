@@ -91,3 +91,40 @@ def test_description_region_with_disclaimer_h1_still_uses_real_title_and_relatio
     assert len(rel) == 1
     assert rel[0].relation_type == "dependency"
     assert rel[0].url.endswith("/77")
+
+
+def test_div_span_mod_links_are_parsed_and_unmarked_links_default_to_recommendations():
+    html = '''<html><head><meta property="og:title" content="A Culinary Artillery"></head><body>
+      <div id="tab-description">
+        <h2>Expanded Foods Suite</h2>
+        <div class="mod-row"><span><a href="https://mods.vintagestory.at/expandedfoodscore">Expanded Foods: Core</a></span> - REQUIRED for all Expanded Foods modules.</div>
+        <div class="mod-row"><span><a href="https://mods.vintagestory.at/show/mod/44555">Expanded Foods: Meals Module</a></span> - Want to cook top-notch meals? Grab this!</div>
+        <div class="mod-row"><span><a href="https://mods.vintagestory.at/show/mod/44556">Expanded Foods: Chef's Tricks</a></span> - Want to get extra goodies like lime, salt and resin!</div>
+      </div>
+    </body></html>'''
+
+    rel = extract_relationships(html, [])
+    by_url = {item.url: item for item in rel}
+    assert by_url["https://mods.vintagestory.at/expandedfoodscore"].relation_type == "dependency"
+    assert by_url["https://mods.vintagestory.at/show/mod/44555"].relation_type == "optional_dependency"
+    assert by_url["https://mods.vintagestory.at/show/mod/44556"].relation_type == "optional_dependency"
+    assert 0.5 <= by_url["https://mods.vintagestory.at/show/mod/44555"].confidence < 0.90
+
+
+def test_recommended_mod_combination_outside_description_tab_is_parsed():
+    html = '''<html><head><meta property="og:title" content="Adventurer's Walking Stick"></head><body>
+      <div id="tab-description">
+        <h3>Compatibility</h3>
+        <div class="compatibility-row"><span><a href="https://mods.vintagestory.at/immersivemining#tab-description">Salty &amp; Toast's Immersive: Mining</a></span></div>
+      </div>
+      <aside class="recommended-mods">
+        <h3>Recommended mod combination</h3>
+        <div class="recommended-row"><span><a href="https://mods.vintagestory.at/show/mod/65912">Shepherd's Herding</a></span> - great mod by PigeonDesigner</div>
+      </aside>
+    </body></html>'''
+
+    rel = extract_relationships(html, [])
+    by_url = {item.url: item for item in rel}
+    assert by_url["https://mods.vintagestory.at/immersivemining"].relation_type == "compatible"
+    assert by_url["https://mods.vintagestory.at/show/mod/65912"].relation_type == "optional_dependency"
+    assert by_url["https://mods.vintagestory.at/show/mod/65912"].confidence >= 0.90

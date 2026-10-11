@@ -34,7 +34,7 @@ const UNKNOWN_TAG_STYLES = [
   ['#402b2b', '#f4b9aa', '#9e6357'],
   ['#303044', '#c7c8ff', '#7778a6']
 ];
-const SORT_LABELS = { name: 'Название', tags: 'Теги', version: 'Версия мода' };
+const SORT_LABELS = { name: 'Название', tags: 'Теги', version: 'Версия VS' };
 
 function tagStyle(name) {
   const key = String(name || '').trim().toLocaleLowerCase('en-US');
@@ -92,7 +92,7 @@ function sortedMods(mods) {
   return [...mods].sort((a, b) => {
     let result = 0;
     if (state.sortBy === 'version') {
-      result = compareVersions(a.latest_mod_version, b.latest_mod_version);
+      result = compareVersions(a.latest_game_version, b.latest_game_version);
     } else if (state.sortBy === 'tags') {
       const tagsA = [...(Array.isArray(a.tags) ? a.tags : [])].sort((x,y) => String(x).localeCompare(String(y), 'en', {sensitivity:'base'}));
       const tagsB = [...(Array.isArray(b.tags) ? b.tags : [])].sort((x,y) => String(x).localeCompare(String(y), 'en', {sensitivity:'base'}));
@@ -256,8 +256,8 @@ function autoNoteHtml(mod, info) {
 
 function card(m, info) {
   const selected = info.selected.has(m.id);
-  const version = m.latest_mod_version ? `v${m.latest_mod_version}` : (m.latest_game_version || 'Версия не указана');
-  const gameVersionNote = m.latest_mod_version && m.latest_game_version ? `<small class="game-version-note">Vintage Story ${esc(m.latest_game_version)}</small>` : '';
+  // Catalog cards show the supported Vintage Story version only, never the mod's own release.
+  const version = m.latest_game_version ? `VS ${m.latest_game_version}` : 'VS —';
   const tagsHtml = (Array.isArray(m.tags) && m.tags.length) ? `<div class="mod-tags">${m.tags.map(tagChip).join('')}</div>` : '';
   const displayId = m.display_mod_id || m.mod_id || m.mod_db_id || m.mod_db_asset_id;
   const modId = displayId ? `modid: ${displayId}` : 'modid: не указан';
@@ -270,13 +270,13 @@ function card(m, info) {
       ${m.image_url ? `<img class="cover" loading="lazy" src="${esc(m.image_url)}" alt="" />` : `<div class="cover empty">Нет превью</div>`}
     </div>
     <div class="card-body">
-      <div class="title-row"><div class="title">${esc(m.name)} ${originBadge}</div><div class="version-stack"><span class="badge">${esc(version)}</span>${gameVersionNote}</div></div>
+      <div class="title-row"><div class="title">${esc(m.name)} ${originBadge}</div><div class="version-stack"><span class="badge" title="Версия Vintage Story">${esc(version)}</span></div></div>
       ${tagsHtml}
       <div class="desc">${esc(m.short_description || m.description || 'Описание отсутствует')}</div>
       <div>${modIdHtml}</div>
       ${autoNoteHtml(m, info)}
       <div class="actions">
-        <button type="button" data-rel="${m.id}">Связи</button>
+        <button type="button" data-rel="${m.id}">Совместимости</button>
       </div>
     </div>
     <div id="rel-${m.id}" class="rel-panel"></div>
@@ -302,26 +302,46 @@ function renderSelectionList(info) {
 
 function relationLabel(type) {
   return ({
-    dependency: 'зависимость',
-    optional_dependency: 'опциональная зависимость',
-    compatible: 'совместим',
+    optional_dependency: 'рекомендация',
+    compatible: 'совместимость',
     incompatible: 'конфликт',
     addon: 'дополнение',
     required_by: 'нужен другим модам'
   })[type] || type;
 }
 
-function relationHtml(d) {
-  const all = [ ...(d.dependencies || []), ...(d.compatibility || []), ...(d.addons || []) ];
-  if (!all.length) return '<div class="relation-empty">Связи не найдены</div>';
-  return all.map(x => {
+function relationHtml(d, sourceMod) {
+  // Required dependencies are handled automatically by build resolution. Discord reply-based
+  // add-ons already have their own catalog cards, so this panel only shows Mod DB page-derived
+  // recommendations, compatibility, conflicts and reverse-dependency hints.
+  const all = [
+    ...(d.dependencies || []).filter(x => ['optional_dependency', 'required_by', 'addon'].includes(x.relation_type)),
+    ...(d.compatibility || [])
+  ];
+  const unique = [];
+  const seen = new Set();
+  for (const row of all) {
+    const key = `${row.relation_type}|${String(row.target_url || '').replace(/\/$/, '').toLowerCase()}|${String(row.target_name || '').toLowerCase()}`;
+    if (!seen.has(key)) { seen.add(key); unique.push(row); }
+  }
+  if (!unique.length) return '<div class="relation-empty">Совместимости и рекомендации не найдены на странице мода</div>';
+  return unique.map(x => {
     const label = relationLabel(x.relation_type);
     const confidence = `${Math.round((x.confidence ?? 0) * 100)}%`;
-    const name = x.target_url ? `<a href="${esc(x.target_url)}" target="_blank" rel="noopener">${esc(x.target_name || 'Без названия')}</a>` : `<span>${esc(x.target_name || 'Не сопоставлено')}</span>`;
+    const targetName = x.target_name || 'Без названия';
+    const name = x.target_url
+      ? `<a href="${esc(x.target_url)}" target="_blank" rel="noopener">${esc(targetName)}</a>`
+      : `<span>${esc(targetName)}</span>`;
     const lowConfidence = (x.confidence ?? 0) < 0.90;
-    const confidenceNote = lowConfidence ? '<em class="rel-note">не учитывается при выборе зависимостей</em>' : '';
+    const confidenceNote = lowConfidence ? '<em class="rel-note">низкая уверенность определения</em>' : '';
     const source = x.source_kind ? `<span class="rel-note">${esc(x.source_kind)}${x.required_version ? ` · ≥ ${esc(x.required_version)}` : ''}</span>` : '';
-    return `<div class="rel-line"><div class="rel-main">${name}<small>${esc(x.raw_phrase || '')}</small>${source}${confidenceNote}</div><div class="rel-meta"><strong class="rel-type ${esc(x.relation_type)}">${esc(label)}</strong><span>${esc(confidence)}</span></div></div>`;
+    let requestButton = '';
+    if (x.target_url) {
+      const already = Boolean(x.in_catalog);
+      const tooltip = already ? 'Этот мод уже есть в каталоге' : 'Запросить добавление мода в #mod-registry';
+      requestButton = `<button type="button" class="request-mod-btn${already ? ' already-in-catalog' : ''}" data-request-mod="1" data-target-name="${esc(targetName)}" data-target-url="${esc(x.target_url)}" data-source-mod-id="${sourceMod.id}" data-relation-type="${esc(x.relation_type)}" ${already ? 'disabled' : ''} title="${tooltip}" aria-label="${tooltip}"><span aria-hidden="true">+</span></button>`;
+    }
+    return `<div class="rel-line"><div class="rel-main">${name}<small>${esc(x.raw_phrase || '')}</small>${source}${confidenceNote}</div><div class="rel-tools"><div class="rel-meta"><strong class="rel-type ${esc(x.relation_type)}">${esc(label)}</strong><span>${esc(confidence)}</span></div>${requestButton}</div></div>`;
   }).join('');
 }
 
@@ -332,12 +352,57 @@ async function toggleRelation(id, button) {
   try {
     const res = await fetch(`/api/mods/${id}/relations`);
     const data = await res.json();
-    p.innerHTML = relationHtml(data);
+    if (!res.ok) throw new Error(data.detail || 'Не удалось загрузить совместимости');
+    const sourceMod = state.mods.find(m => m.id === id) || { id, name: 'неизвестный мод' };
+    p.innerHTML = relationHtml(data, sourceMod);
     p.classList.add('open');
   } catch (err) {
-    p.innerHTML = `<div class="relation-empty">Ошибка загрузки связей: ${esc(err.message || err)}</div>`;
+    p.innerHTML = `<div class="relation-empty">Ошибка загрузки совместимостей: ${esc(err.message || err)}</div>`;
     p.classList.add('open');
   } finally { button.disabled = false; }
+}
+
+async function requestCatalogMod(button) {
+  const original = button.innerHTML;
+  button.disabled = true;
+  button.classList.add('is-loading');
+  button.innerHTML = '<span aria-hidden="true">…</span>';
+  button.title = 'Отправляем запрос…';
+  try {
+    const res = await fetch('/api/catalog-requests', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        target_name: button.dataset.targetName,
+        target_url: button.dataset.targetUrl,
+        source_mod_id: Number(button.dataset.sourceModId),
+        relation_type: button.dataset.relationType
+      })
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      if (res.status === 409 && data.detail?.code === 'already_in_catalog') {
+        button.classList.remove('is-loading');
+        button.classList.add('already-in-catalog');
+        button.innerHTML = '<span aria-hidden="true">+</span>';
+        button.title = 'Этот мод уже есть в каталоге';
+        button.setAttribute('aria-label', button.title);
+        return;
+      }
+      throw new Error(typeof data.detail === 'string' ? data.detail : (data.detail?.message || 'Не удалось отправить запрос'));
+    }
+    button.classList.remove('is-loading');
+    button.classList.add('request-sent');
+    button.innerHTML = '<span aria-hidden="true">✓</span>';
+    button.title = data.status === 'already_requested' ? 'Запрос уже отправлен в #mod-registry' : 'Запрос отправлен в #mod-registry';
+    button.setAttribute('aria-label', button.title);
+  } catch (err) {
+    button.disabled = false;
+    button.classList.remove('is-loading');
+    button.innerHTML = original;
+    button.title = `Ошибка отправки. ${err.message || err}`;
+    alert(button.title);
+  }
 }
 
 function toggleCard(id) {
@@ -457,6 +522,8 @@ async function pollDownload(id) {
 
 document.addEventListener('click', async (e) => {
   const target = e.target;
+  const requestBtn = target.closest('[data-request-mod]');
+  if (requestBtn) { e.stopPropagation(); await requestCatalogMod(requestBtn); return; }
   const relBtn = target.closest('[data-rel]');
   if (relBtn) { e.stopPropagation(); await toggleRelation(Number(relBtn.dataset.rel), relBtn); return; }
   const modLink = target.closest('.modid');

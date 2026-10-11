@@ -83,3 +83,16 @@ dialog{border:0;padding:0;background:transparent;color:var(--text)}dialog::backd
 .tag-chip{display:inline-flex;align-items:center;max-width:100%;padding:2px 7px;border-radius:999px;background:var(--tag-bg);color:var(--tag-color);border:1px solid var(--tag-border);font-size:10px;line-height:1.45;font-weight:700;letter-spacing:.01em;white-space:nowrap}
 @media(max-width:900px){.toolbar{gap:12px}.field.search-field{flex:1 1 auto;width:auto;max-width:52vw}.tag-filter>summary{min-width:132px;padding-left:10px;padding-right:10px}.sort-btn{min-width:164px;padding-left:9px;padding-right:9px}}
 @media(max-width:700px){.shell{padding:18px 14px 130px}.catalog-meta-row{margin-bottom:8px}.toolbar{flex-wrap:wrap;gap:8px;margin-bottom:16px}.field.search-field{flex:1 0 100%;width:100%}.search-field input{width:100%;height:42px}.tag-filter{flex:1 1 0;min-width:0}.tag-filter>summary{width:100%;min-width:0;height:42px;padding:9px 10px;font-size:12px}.sort-wrap{flex:1 1 0;min-width:0}.sort-btn{width:100%;min-width:0;height:42px;max-width:none;white-space:nowrap;text-align:center;font-size:11px;padding:8px}.tag-filter-menu{left:0;right:auto}.sort-menu{right:0}#catalogMeta{font-size:11px}.dialog-form{grid-template-columns:1fr}}
+
+
+/* 0.5.3: relation extraction includes unlabelled Mod DB links at lower confidence. */
+.rel-tools{display:flex;flex-direction:row;align-items:center;gap:9px;flex:0 0 auto}
+.rel-meta{display:flex;flex-direction:column;align-items:flex-end;gap:2px;white-space:nowrap}
+.request-mod-btn{display:inline-flex;align-items:center;justify-content:center;width:29px;height:29px;flex:0 0 29px;padding:0;border:1px solid #5571a2;border-radius:8px;background:#253651;color:#c6dcff;font-size:20px;line-height:1;font-weight:500;cursor:pointer;transition:background .15s,border-color .15s,color .15s,transform .15s}
+.request-mod-btn:hover:not(:disabled){background:#314e78;border-color:#7ea4e8;color:#fff;transform:translateY(-1px)}
+.request-mod-btn:focus-visible{outline:2px solid #90b4fa;outline-offset:2px}
+.request-mod-btn:disabled{cursor:not-allowed;transform:none}
+.request-mod-btn.already-in-catalog{background:#262a31;border-color:#414751;color:#767e89;opacity:.78}
+.request-mod-btn.is-loading{background:#2e3440;color:#d5dce6;opacity:.85}
+.request-mod-btn.request-sent{background:#173c2e;border-color:#367d56;color:#9be0b7}
+@media(max-width:480px){.rel-line{gap:8px}.rel-tools{gap:6px}.rel-meta{font-size:10px}.request-mod-btn{width:27px;height:27px;flex-basis:27px}}

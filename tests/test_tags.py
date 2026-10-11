@@ -77,3 +77,10 @@ def test_tag_lists_match_detects_stale_persisted_tags_but_ignores_order_and_case
 
     assert tag_lists_match(["survival", "Nature"], ["Nature", "Survival"])
     assert not tag_lists_match([], ["Survival"])
+
+
+def test_addon_mod_inherits_parent_forum_tags():
+    import json
+    from app.services.tags import tag_names_json
+
+    assert json.loads(tag_names_json(["Survival", "Crafting", "Survival"])) == ["Crafting", "Survival"]
