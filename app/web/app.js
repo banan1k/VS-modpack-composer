@@ -5,10 +5,118 @@ const state = {
   buildName: '',
   gameVersion: '',
   search: '',
+  selectedTags: new Set(),
+  sortBy: 'name',
+  sortDirection: 'asc',
   prefetchWasRunning: false,
-  prefetchCatalogRefreshed: false
+  prefetchCatalogRefreshed: false,
+  prefetchStatusText: ''
 };
 const $ = (s) => document.querySelector(s);
+
+// Theme colors are intentionally defined by the website, not by Discord tag colors.
+const TAG_STYLES = {
+  survival:   ['#4a2027', '#ffabb4', '#8f424e'],
+  crafting:   ['#4b2d1c', '#ffc08a', '#985c31'],
+  building:   ['#3d2d24', '#d9b39a', '#805b44'],
+  exploration:['#18374c', '#9bd8ff', '#397da5'],
+  nature:     ['#183b2c', '#9be0b7', '#367d56'],
+  combat:     ['#242830', '#e0e4eb', '#4c535f'],
+  cosmetic:   ['#453b17', '#ffe68a', '#97802c'],
+  visual:     ['#47243a', '#ffb6dc', '#98517e'],
+  qol:        ['#303740', '#d0d7df', '#64707d'],
+  lib:        ['#38294c', '#d5b8ff', '#7955a5']
+};
+const UNKNOWN_TAG_STYLES = [
+  ['#173b3a', '#9de6dc', '#3e817b'],
+  ['#45301d', '#f2c889', '#9e7137'],
+  ['#26364e', '#b4caff', '#5b79b0'],
+  ['#402b2b', '#f4b9aa', '#9e6357'],
+  ['#303044', '#c7c8ff', '#7778a6']
+];
+const SORT_LABELS = { name: 'Название', tags: 'Теги', version: 'Версия мода' };
+
+function tagStyle(name) {
+  const key = String(name || '').trim().toLocaleLowerCase('en-US');
+  let style = TAG_STYLES[key];
+  if (!style) {
+    let hash = 0;
+    for (const char of key) hash = (hash * 31 + char.charCodeAt(0)) | 0;
+    style = UNKNOWN_TAG_STYLES[Math.abs(hash) % UNKNOWN_TAG_STYLES.length];
+  }
+  return `--tag-bg:${style[0]};--tag-color:${style[1]};--tag-border:${style[2]}`;
+}
+
+function tagChip(tag) {
+  return `<span class="tag-chip" style="${tagStyle(tag)}">${esc(tag)}</span>`;
+}
+
+function uniqueCatalogTags() {
+  return [...new Set(state.mods.flatMap(m => Array.isArray(m.tags) ? m.tags : []))]
+    .sort((a, b) => String(a).localeCompare(String(b), 'en', {sensitivity:'base'}));
+}
+
+function renderTagFilter() {
+  const tags = uniqueCatalogTags();
+  $('#tagOptions').innerHTML = tags.length ? tags.map(tag => `
+    <label class="tag-option">
+      <input type="checkbox" data-tag-filter="${esc(tag)}" ${state.selectedTags.has(tag) ? 'checked' : ''} />
+      ${tagChip(tag)}
+    </label>`).join('') : '<span class="filter-empty">В каталоге пока нет тегов</span>';
+  const count = state.selectedTags.size;
+  $('#tagFilterSummary').textContent = count ? `Теги: ${count}` : 'Теги: все';
+  $('#clearTagFilters').disabled = !count;
+}
+
+function compareVersions(a, b) {
+  const tokenize = value => String(value || '').toLocaleLowerCase('en-US').match(/\d+|[a-z]+/g) || [];
+  const aa = tokenize(a), bb = tokenize(b);
+  if (!aa.length && !bb.length) return 0;
+  if (!aa.length) return -1;
+  if (!bb.length) return 1;
+  const length = Math.max(aa.length, bb.length);
+  for (let i = 0; i < length; i++) {
+    if (aa[i] === undefined) return -1;
+    if (bb[i] === undefined) return 1;
+    if (aa[i] === bb[i]) continue;
+    const an = /^\d+$/.test(aa[i]), bn = /^\d+$/.test(bb[i]);
+    if (an && bn) return Number(aa[i]) - Number(bb[i]);
+    if (an !== bn) return an ? 1 : -1;
+    return aa[i].localeCompare(bb[i], 'en');
+  }
+  return 0;
+}
+
+function sortedMods(mods) {
+  const direction = state.sortDirection === 'asc' ? 1 : -1;
+  return [...mods].sort((a, b) => {
+    let result = 0;
+    if (state.sortBy === 'version') {
+      result = compareVersions(a.latest_mod_version, b.latest_mod_version);
+    } else if (state.sortBy === 'tags') {
+      const tagsA = [...(Array.isArray(a.tags) ? a.tags : [])].sort((x,y) => String(x).localeCompare(String(y), 'en', {sensitivity:'base'}));
+      const tagsB = [...(Array.isArray(b.tags) ? b.tags : [])].sort((x,y) => String(x).localeCompare(String(y), 'en', {sensitivity:'base'}));
+      if (!tagsA.length && tagsB.length) result = 1;
+      else if (tagsA.length && !tagsB.length) result = -1;
+      else result = (tagsA[0] || '').localeCompare(tagsB[0] || '', 'en', {sensitivity:'base'});
+      if (!result && tagsA.length !== tagsB.length) result = tagsA.length - tagsB.length;
+    } else {
+      result = String(a.name || '').localeCompare(String(b.name || ''), 'en', {sensitivity:'base'});
+    }
+    if (!result) result = String(a.name || '').localeCompare(String(b.name || ''), 'en', {sensitivity:'base'});
+    return result * direction;
+  });
+}
+
+function updateSortUi() {
+  const arrow = state.sortDirection === 'asc' ? '↑' : '↓';
+  $('#sortBtn').textContent = `Сортировка: ${SORT_LABELS[state.sortBy]} ${arrow}`;
+  for (const option of $('#sortMenu').querySelectorAll('[data-sort]')) {
+    const active = option.dataset.sort === state.sortBy;
+    option.classList.toggle('active', active);
+    option.querySelector('span').textContent = active ? arrow : '';
+  }
+}
 
 function esc(v) {
   return String(v ?? '').replace(/[&<>"']/g, ch => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[ch]));
@@ -59,15 +167,27 @@ function selectionInfo() {
 
 function filteredMods() {
   const q = state.search.trim().toLocaleLowerCase('ru-RU');
-  if (!q) return state.mods;
-  return state.mods.filter(m => [m.name, m.mod_id, m.mod_db_id, m.mod_db_asset_id, m.short_description, m.description]
-    .some(v => String(v ?? '').toLocaleLowerCase('ru-RU').includes(q)));
+  return sortedMods(state.mods.filter(m => {
+    const textMatch = !q || [m.name, m.mod_id, m.mod_db_id, m.mod_db_asset_id, m.short_description, m.description, ...(m.tags || [])]
+      .some(v => String(v ?? '').toLocaleLowerCase('ru-RU').includes(q));
+    const modTags = new Set((Array.isArray(m.tags) ? m.tags : []).map(tag => String(tag).toLocaleLowerCase('en-US')));
+    const tagMatch = [...state.selectedTags].every(tag => modTags.has(String(tag).toLocaleLowerCase('en-US')));
+    return textMatch && tagMatch;
+  }));
+}
+
+function uniqueCatalogTagsSafe(mods) {
+  return [...new Set(mods.flatMap(m => Array.isArray(m.tags) ? m.tags : []))];
 }
 
 async function loadCatalogData() {
   const res = await fetch('/api/catalog');
   if (!res.ok) return false;
   state.mods = await res.json();
+  // Remove filters for tags deleted from the current Discord forum definitions.
+  const present = new Set(uniqueCatalogTagsSafe(state.mods));
+  state.selectedTags = new Set([...state.selectedTags].filter(tag => present.has(tag)));
+  renderTagFilter();
   return true;
 }
 
@@ -96,12 +216,15 @@ async function pollPrefetchStatus() {
       if (status.running) {
         state.prefetchWasRunning = true;
         state.prefetchCatalogRefreshed = false;
-        const base = state.search.trim() ? `${filteredMods().length} из ${state.mods.length} модов` : `${state.mods.length} модов в локальной базе`;
+        const hasFilters = state.search.trim() || state.selectedTags.size;
+        const base = hasFilters ? `${filteredMods().length} из ${state.mods.length} модов` : `${state.mods.length} модов в локальной базе`;
         const progress = status.total ? `${status.current}/${status.total}` : 'подготовка';
-        $('#catalogMeta').textContent = `${base} · фоновая загрузка ${progress}`;
+        state.prefetchStatusText = ` · фоновая загрузка ${progress}`;
+        $('#catalogMeta').textContent = `${base}${state.prefetchStatusText}`;
       } else if (state.prefetchWasRunning || (status.current > 0 && String(status.message || '').startsWith('Предзагрузка завершена') && !state.prefetchCatalogRefreshed)) {
         state.prefetchWasRunning = false;
         state.prefetchCatalogRefreshed = true;
+        state.prefetchStatusText = '';
         await loadCatalogData();
         render();
       }
@@ -112,12 +235,16 @@ async function pollPrefetchStatus() {
 
 function render() {
   const info = selectionInfo();
-  $('#catalog').innerHTML = filteredMods().map(m => card(m, info)).join('') || '<div class="empty-state">Моды не найдены.</div>';
+  const visibleMods = filteredMods();
+  $('#catalog').innerHTML = visibleMods.map(m => card(m, info)).join('') || '<div class="empty-state">Моды не найдены. Попробуй изменить поиск или фильтры.</div>';
+  updateSortUi();
   $('#selectedCount').textContent = info.selected.size;
   $('#selectedCountSmall').textContent = info.selected.size;
   $('#createBtn').disabled = state.explicitSelected.size === 0;
-  const visible = filteredMods().length;
-  $('#catalogMeta').textContent = state.search.trim() ? `${visible} из ${state.mods.length} модов` : `${state.mods.length} модов в локальной базе`;
+  const visible = visibleMods.length;
+  const hasFilters = state.search.trim() || state.selectedTags.size;
+  const baseMeta = hasFilters ? `${visible} из ${state.mods.length} модов` : `${state.mods.length} модов в локальной базе`;
+  $('#catalogMeta').textContent = `${baseMeta}${state.prefetchStatusText}`;
   renderSelectionList(info);
 }
 
@@ -129,7 +256,9 @@ function autoNoteHtml(mod, info) {
 
 function card(m, info) {
   const selected = info.selected.has(m.id);
-  const version = m.latest_game_version || 'Версия не указана';
+  const version = m.latest_mod_version ? `v${m.latest_mod_version}` : (m.latest_game_version || 'Версия не указана');
+  const gameVersionNote = m.latest_mod_version && m.latest_game_version ? `<small class="game-version-note">Vintage Story ${esc(m.latest_game_version)}</small>` : '';
+  const tagsHtml = (Array.isArray(m.tags) && m.tags.length) ? `<div class="mod-tags">${m.tags.map(tagChip).join('')}</div>` : '';
   const displayId = m.display_mod_id || m.mod_id || m.mod_db_id || m.mod_db_asset_id;
   const modId = displayId ? `modid: ${displayId}` : 'modid: не указан';
   const modIdHtml = m.mod_db_url
@@ -141,7 +270,8 @@ function card(m, info) {
       ${m.image_url ? `<img class="cover" loading="lazy" src="${esc(m.image_url)}" alt="" />` : `<div class="cover empty">Нет превью</div>`}
     </div>
     <div class="card-body">
-      <div class="title-row"><div class="title">${esc(m.name)} ${originBadge}</div><span class="badge">${esc(version)}</span></div>
+      <div class="title-row"><div class="title">${esc(m.name)} ${originBadge}</div><div class="version-stack"><span class="badge">${esc(version)}</span>${gameVersionNote}</div></div>
+      ${tagsHtml}
       <div class="desc">${esc(m.short_description || m.description || 'Описание отсутствует')}</div>
       <div>${modIdHtml}</div>
       ${autoNoteHtml(m, info)}
@@ -350,6 +480,45 @@ $('#selectionToggle').onclick = () => {
   $('#selectionToggle').setAttribute('aria-expanded', String(!collapsed));
 };
 $('#searchInput').addEventListener('input', e => { state.search = e.target.value; render(); });
+$('#tagOptions').addEventListener('change', e => {
+  const input = e.target.closest('[data-tag-filter]');
+  if (!input) return;
+  if (input.checked) state.selectedTags.add(input.dataset.tagFilter);
+  else state.selectedTags.delete(input.dataset.tagFilter);
+  renderTagFilter();
+  render();
+});
+$('#clearTagFilters').onclick = () => {
+  state.selectedTags.clear();
+  renderTagFilter();
+  render();
+};
+$('#sortBtn').onclick = () => {
+  const menu = $('#sortMenu');
+  menu.classList.toggle('hidden');
+  $('#sortBtn').setAttribute('aria-expanded', String(!menu.classList.contains('hidden')));
+};
+$('#sortMenu').addEventListener('click', e => {
+  const option = e.target.closest('[data-sort]');
+  if (!option) return;
+  const selected = option.dataset.sort;
+  if (selected === state.sortBy) {
+    state.sortDirection = state.sortDirection === 'asc' ? 'desc' : 'asc';
+  } else {
+    state.sortBy = selected;
+    state.sortDirection = selected === 'version' ? 'desc' : 'asc';
+  }
+  $('#sortMenu').classList.add('hidden');
+  $('#sortBtn').setAttribute('aria-expanded', 'false');
+  render();
+});
+document.addEventListener('click', e => {
+  if (!e.target.closest('.sort-wrap')) {
+    $('#sortMenu').classList.add('hidden');
+    $('#sortBtn').setAttribute('aria-expanded', 'false');
+  }
+  if (!e.target.closest('#tagFilter')) $('#tagFilter').open = false;
+});
 $('#refreshBtn').onclick = startSync;
 $('#createBtn').onclick = openBuildDialog;
 $('#buildBack').onclick = () => $('#buildDialog').close();

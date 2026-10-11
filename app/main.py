@@ -8,6 +8,7 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 import discord
+from discord import app_commands
 from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
@@ -25,6 +26,8 @@ from .services.moddb import ModDBClient
 from .services.prefetch import PrefetchManager
 from .services.priority import PriorityCoordinator
 from .services.sync import CatalogSyncService
+from .services.tags import preserved_forum_tag_ids
+from .services.versioning import version_key
 
 settings.ensure_dirs()
 
@@ -58,12 +61,135 @@ intents.guilds = True
 intents.messages = True
 intents.message_content = True
 bot = discord.Client(intents=intents)
+command_tree = app_commands.CommandTree(bot)
 discord_task: asyncio.Task | None = None
+_commands_synced = False
+
+
+@command_tree.command(
+    name="sync-forum-tags",
+    description="Скопировать набор тегов из одного форума во все остальные форумы каталога.",
+)
+@app_commands.describe(source_channel="Форум, в котором настроен правильный набор тегов")
+@app_commands.checks.has_permissions(manage_channels=True)
+async def sync_forum_tags(interaction: discord.Interaction, source_channel: discord.ForumChannel):
+    """Mirror available forum-tag definitions from one configured forum to the others."""
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    if interaction.guild is None or not settings.discord_guild_id or interaction.guild.id != settings.discord_guild_id:
+        await interaction.followup.send("Команда доступна только на настроенном Discord-сервере.", ephemeral=True)
+        return
+
+    forum_ids = settings.forum_channel_ids
+    if not forum_ids:
+        await interaction.followup.send("Сначала укажи DISCORD_FORUM_CHANNEL_IDS в .env.", ephemeral=True)
+        return
+    if source_channel.id not in forum_ids:
+        await interaction.followup.send(
+            "Исходный форум должен входить в DISCORD_FORUM_CHANNEL_IDS.", ephemeral=True
+        )
+        return
+    if source_channel.guild.id != interaction.guild.id:
+        await interaction.followup.send("Исходный форум принадлежит другому серверу.", ephemeral=True)
+        return
+
+    targets: list[discord.ForumChannel] = []
+    errors: list[str] = []
+    bot_member = interaction.guild.me
+    if bot_member is None and bot.user is not None:
+        try:
+            bot_member = await interaction.guild.fetch_member(bot.user.id)
+        except discord.HTTPException as exc:
+            errors.append(f"не удалось получить участника-бота: {exc}")
+
+    for channel_id in forum_ids:
+        if channel_id == source_channel.id:
+            continue
+        try:
+            channel = bot.get_channel(channel_id) or await bot.fetch_channel(channel_id)
+        except discord.HTTPException as exc:
+            errors.append(f"канал {channel_id}: не удалось получить канал ({exc})")
+            continue
+        if not isinstance(channel, discord.ForumChannel):
+            errors.append(f"канал {channel_id}: это не форум")
+            continue
+        if channel.guild.id != interaction.guild.id:
+            errors.append(f"канал {channel_id}: принадлежит другому серверу")
+            continue
+        if bot_member is None or not channel.permissions_for(bot_member).manage_channels:
+            errors.append(f"#{channel.name}: у бота нет разрешения Manage Channels")
+            continue
+        targets.append(channel)
+
+    if errors:
+        detail = "\n".join(f"• {item}" for item in errors)
+        await interaction.followup.send(
+            "Не изменял каналы: сначала исправь права или конфигурацию.\n" + detail,
+            ephemeral=True,
+        )
+        return
+    if not targets:
+        await interaction.followup.send("Других форумов в DISCORD_FORUM_CHANNEL_IDS не найдено.", ephemeral=True)
+        return
+
+    # Forum tag IDs are local to each channel. Preserve target-local IDs for matching names and
+    # in-place renames so already-applied thread tags continue to point at the mirrored tag.
+    updated: list[str] = []
+    failures: list[str] = []
+    for channel in targets:
+        try:
+            target_ids = preserved_forum_tag_ids(source_channel.available_tags, channel.available_tags)
+            copied_tags = []
+            for source_tag, target_id in zip(source_channel.available_tags, target_ids):
+                clone = discord.ForumTag(name=source_tag.name, moderated=source_tag.moderated, emoji=source_tag.emoji)
+                if target_id is not None:
+                    clone.id = target_id
+                copied_tags.append(clone)
+            await channel.edit(
+                available_tags=copied_tags,
+                reason=f"Forum tags copied from #{source_channel.name} by {interaction.user}",
+            )
+            updated.append(f"#{channel.name}")
+        except discord.HTTPException as exc:
+            failures.append(f"#{channel.name}: {exc}")
+
+    message = (
+        f"Тегов в источнике: **{len(copied_tags)}**. Обновлено форумов: **{len(updated)}**."
+        + ("\nОбновлены: " + ", ".join(updated) if updated else "")
+        + ("\nНе удалось обновить:\n" + "\n".join(f"• {item}" for item in failures) if failures else "")
+        + "\n\nКоманда не переносит назначения тегов из исходных тем в другие темы; существующие назначения в целевых форумах сохраняются для сопоставленных тегов."
+    )
+    await interaction.followup.send(message, ephemeral=True)
+
+
+@sync_forum_tags.error
+async def sync_forum_tags_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.errors.MissingPermissions):
+        message = "Для этой команды необходимо разрешение **Manage Channels**."
+    else:
+        logger.error("[Discord] /sync-forum-tags failed: %s", error, exc_info=(type(error), error, error.__traceback__))
+        message = f"Не удалось выполнить команду: {type(error).__name__}. Подробности записаны в лог."
+    if interaction.response.is_done():
+        await interaction.followup.send(message, ephemeral=True)
+    else:
+        await interaction.response.send_message(message, ephemeral=True)
 
 
 @bot.event
 async def on_ready():
+    global _commands_synced
     logger.info("[Discord] Connected as %s (guilds: %s)", bot.user, len(bot.guilds))
+    if not _commands_synced:
+        try:
+            if settings.discord_guild_id:
+                guild = discord.Object(id=settings.discord_guild_id)
+                command_tree.copy_global_to(guild=guild)
+                synced = await command_tree.sync(guild=guild)
+            else:
+                synced = await command_tree.sync()
+            _commands_synced = True
+            logger.info("[Discord] application commands synced: %s", len(synced))
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("[Discord] application command sync failed: %s", exc)
     # Deliver durable dependency requests created during startup, without rerunning every ZIP.
     asyncio.create_task(prefetch.flush_open_dependency_requests(), name="flush-dependency-requests")
 
@@ -139,7 +265,12 @@ async def shutdown():
 
 @app.get("/", include_in_schema=False)
 async def index():
-    return FileResponse(Path(__file__).parent / "web" / "index.html")
+    # The HTML references versioned JS/CSS assets; revalidate the page itself so clients learn
+    # the new asset URLs immediately after an upgrade rather than keeping an older entry point.
+    return FileResponse(
+        Path(__file__).parent / "web" / "index.html",
+        headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
+    )
 
 
 @app.get("/static/{name}", include_in_schema=False)
@@ -161,13 +292,32 @@ async def catalog():
         mods = (await session.execute(select(Mod).where(Mod.catalog_visible.is_(True)).order_by(Mod.name))).scalars().all()
         mod_ids = [m.id for m in mods]
         deps = (await session.execute(select(Dependency).where(Dependency.mod_id.in_(mod_ids)))).scalars().all() if mod_ids else []
+        latest_versions: dict[int, str] = {}
+        if mod_ids:
+            release_rows = (await session.execute(
+                select(ModRelease.mod_id, ModRelease.mod_version, ModRelease.created_at)
+                .where(ModRelease.mod_id.in_(mod_ids))
+            )).all()
+            release_candidates: dict[int, list[tuple[str, str]]] = {}
+            for release_mod_id, mod_version, created_at in release_rows:
+                if mod_version:
+                    release_candidates.setdefault(release_mod_id, []).append(
+                        (str(mod_version), str(created_at or ""))
+                    )
+            latest_versions = {
+                mod_id: max(candidates, key=lambda item: (version_key(item[0]), item[1]))[0]
+                for mod_id, candidates in release_candidates.items()
+            }
         threshold = settings.relation_min_confidence
         required: dict[int, list[int]] = {}
         for d in deps:
             if d.relation_type == "dependency" and d.confidence >= threshold and d.target_mod_id:
                 required.setdefault(d.mod_id, []).append(d.target_mod_id)
         return [
-            {**serialize_mod(m), "required_dependency_ids": required.get(m.id, [])}
+            {
+                **serialize_mod(m, latest_versions.get(m.id)),
+                "required_dependency_ids": required.get(m.id, []),
+            }
             for m in mods
         ]
 
@@ -428,7 +578,10 @@ async def publish_build(share_id: str, data: BuildPublish):
 
 @app.get("/build/{share_id}", include_in_schema=False)
 async def build_page(share_id: str):
-    return FileResponse(Path(__file__).parent / "web" / "index.html")
+    return FileResponse(
+        Path(__file__).parent / "web" / "index.html",
+        headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
+    )
 
 
 async def _recover_build_from_discord(share_id: str) -> bool:
@@ -640,7 +793,18 @@ def _delete_temp_file(path: Path):
         pass
 
 
-def serialize_mod(m: Mod):
+def _json_string_list(value: str | None) -> list[str]:
+    try:
+        decoded = json.loads(value or "[]")
+    except (TypeError, json.JSONDecodeError):
+        return []
+    if not isinstance(decoded, list):
+        return []
+    from .services.tags import normalize_tag_names
+    return normalize_tag_names(decoded)
+
+
+def serialize_mod(m: Mod, latest_mod_version: str | None = None):
     # Dependency IDs are sent with the catalog so the browser can expand a selection locally
     # without making an extra request for every clicked card.
     # This endpoint is called in the context of a loaded async session, so the relation query is
@@ -659,7 +823,9 @@ def serialize_mod(m: Mod):
         "mod_type": m.mod_type,
         "mod_db_url": m.mod_db_url,
         "supported_versions": json.loads(m.supported_versions_json or "[]"),
+        "tags": _json_string_list(m.tags_json),
         "latest_game_version": m.latest_game_version,
+        "latest_mod_version": latest_mod_version,
         "latest_file_name": m.latest_file_name,
         "parse_status": m.parse_status,
         "parse_message": m.parse_message,

@@ -31,6 +31,8 @@ class Mod(Base):
     mod_type: Mapped[str | None] = mapped_column(String(80))
     mod_db_url: Mapped[str | None] = mapped_column(Text)
     supported_versions_json: Mapped[str] = mapped_column(Text, default="[]")
+    # Applied tags from the Discord forum thread that represents this mod.
+    tags_json: Mapped[str] = mapped_column(Text, default="[]")
     latest_game_version: Mapped[str | None] = mapped_column(String(80))
     latest_release_id: Mapped[int | None] = mapped_column(Integer)
     latest_file_url: Mapped[str | None] = mapped_column(Text)

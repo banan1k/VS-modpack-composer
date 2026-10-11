@@ -20,6 +20,7 @@ from .moddb import ModDBClient, ModDBData
 from .parser import extract_api_relationships, extract_relationships, normalize_name
 from .identity import canonical_identifier
 from .versioning import latest_game_version, version_key
+from .tags import normalize_tag_names, tag_lists_match
 
 logger = logging.getLogger(__name__)
 
@@ -71,9 +72,19 @@ class CatalogSyncService:
                 if not mod:
                     mod = await self._find_existing_mod(session, source_url=rec.mod_db_url)
                 effective_source_hash = _source_fingerprint(rec.source_hash)
-                # A source changed, an algorithm changed, or this record has addon children whose
-                # metadata may not have been enriched yet.
-                if source and mod and source.source_hash == effective_source_hash:
+                # The persisted tag list is checked independently of the fingerprint. This also
+                # repairs databases created by a build that hashed Discord posts correctly but
+                # failed to persist their applied forum tags.
+                try:
+                    stored_tags_raw = json.loads(mod.tags_json or "[]") if mod else []
+                except (TypeError, json.JSONDecodeError):
+                    stored_tags_raw = []
+                stored_tags = stored_tags_raw if isinstance(stored_tags_raw, list) else []
+                current_tags = normalize_tag_names(rec.tags)
+                tags_out_of_sync = mod is not None and not tag_lists_match(stored_tags, current_tags)
+                # A source changed, stored tags are stale, an algorithm changed, or this record
+                # has addon children whose metadata may not have been enriched yet.
+                if source and mod and source.source_hash == effective_source_hash and not tags_out_of_sync:
                     unchanged += 1
                 else:
                     changed.append((rec, mod))
@@ -276,6 +287,7 @@ class CatalogSyncService:
             # The human forum-post title is a deliberate alias for dependency resolution. The linked
             # page may be a fixed/forked build with a different in-game modinfo identifier.
             mod.canonical_id = canonical_identifier(rec.title)
+            mod.tags_json = json.dumps(normalize_tag_names(rec.tags), ensure_ascii=False)
             release_rows = await self._replace_releases(session, mod, data.releases)
             self._recompute_latest(mod, release_rows)
 
@@ -608,12 +620,13 @@ class CatalogSyncService:
         if channel is None or not hasattr(channel, "send") or client.user is None:
             return
         manifest = {
-            "schema": 4,
+            "schema": 5,
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "records": [
                 {
                     "title": r.title,
                     "url": r.mod_db_url,
+                    "tags": normalize_tag_names(r.tags),
                     "channel_id": r.channel_id,
                     "thread_id": r.thread_id,
                     "starter_message_id": r.starter_message_id,

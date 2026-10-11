@@ -11,6 +11,7 @@ from typing import Any
 import discord
 
 from ..config import settings
+from .tags import normalize_tag_names, thread_tag_names
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +28,7 @@ class DiscordModRecord:
     thread_id: int
     starter_message_id: int
     starter_content: str
+    tags: list[str]
     source_hash: str
     addons: list[dict[str, Any]]
 
@@ -121,10 +123,17 @@ class DiscordCatalogScanner:
         results = await asyncio.gather(*(scan_one(thread) for thread in threads), return_exceptions=False)
         records = [r for r in results if r is not None]
         complete = not errors
+        tagged_records = [record for record in records if record.tags]
+        tag_counts: dict[str, int] = {}
+        for record in tagged_records:
+            for tag in record.tags:
+                tag_counts[tag] = tag_counts.get(tag, 0) + 1
         logger.info(
-            "[DISCORD] scan finished: threads=%s records=%s skipped_no_link=%s errors=%s complete=%s",
+            "[DISCORD] scan finished: threads=%s records=%s tagged_records=%s tags=%s skipped_no_link=%s errors=%s complete=%s",
             total,
             len(records),
+            len(tagged_records),
+            dict(sorted(tag_counts.items(), key=lambda pair: pair[0].casefold())),
             skipped,
             len(errors),
             complete,
@@ -163,11 +172,20 @@ class DiscordCatalogScanner:
         except discord.HTTPException as exc:
             logger.warning("[DISCORD] addon history failed thread=%s: %s", thread.id, exc)
 
+        tags = thread_tag_names(thread, forum)
+        if tags:
+            logger.info(
+                "[DISCORD] applied forum tags: forum=%s thread=%s tags=%s",
+                getattr(forum, "name", forum),
+                thread.name,
+                tags,
+            )
         payload = {
             "source_version": settings.catalog_source_version,
             "title": thread.name,
             "content": starter_content,
             "url": mod_db_url,
+            "tags": tags,
             "addons": addons,
         }
         source_hash = hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
@@ -180,6 +198,7 @@ class DiscordCatalogScanner:
             thread_id=thread.id,
             starter_message_id=starter.id,
             starter_content=starter_content,
+            tags=tags,
             source_hash=source_hash,
             addons=addons,
         )

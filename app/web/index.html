@@ -4,7 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Vintage Story Modpack Builder</title>
-  <link rel="stylesheet" href="/static/style.css" />
+  <link rel="stylesheet" href="/static/style.css?v=0.5.1" />
 </head>
 <body>
   <header class="topbar">
@@ -26,12 +26,31 @@
   </header>
 
   <main class="shell">
-    <section class="toolbar">
+    <section class="catalog-meta-row" aria-live="polite">
+      <div id="catalogMeta" class="meta">Загрузка каталога…</div>
+    </section>
+
+    <section class="toolbar" aria-label="Поиск и управление каталогом">
       <div class="field search-field">
         <label for="searchInput">Поиск</label>
         <input id="searchInput" placeholder="название, modid или описание" autocomplete="off" />
       </div>
-      <div id="catalogMeta" class="meta">Загрузка каталога…</div>
+      <details id="tagFilter" class="tag-filter">
+        <summary id="tagFilterSummary">Теги: все</summary>
+        <div class="tag-filter-menu">
+          <div class="tag-filter-heading">Показывать моды с каждым выбранным тегом</div>
+          <div id="tagOptions" class="tag-options"><span class="filter-empty">Загрузка тегов…</span></div>
+          <button id="clearTagFilters" type="button" class="ghost clear-tags">Сбросить фильтр</button>
+        </div>
+      </details>
+      <div class="sort-wrap">
+        <button id="sortBtn" class="sort-btn" type="button" aria-expanded="false" aria-controls="sortMenu">Сортировка: Название ↑</button>
+        <div id="sortMenu" class="sort-menu hidden" role="menu" aria-label="Сортировка каталога">
+          <button type="button" data-sort="name" role="menuitem">Название <span></span></button>
+          <button type="button" data-sort="tags" role="menuitem">Теги <span></span></button>
+          <button type="button" data-sort="version" role="menuitem">Версия мода <span></span></button>
+        </div>
+      </div>
     </section>
 
     <section id="catalog" class="grid"></section>
@@ -95,6 +114,6 @@
     </div>
   </dialog>
 
-<script src="/static/app.js"></script>
+<script src="/static/app.js?v=0.5.1"></script>
 </body>
 </html>

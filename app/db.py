@@ -65,6 +65,8 @@ def _migrate_schema(sync_conn) -> None:
         sync_conn.exec_driver_sql("ALTER TABLE mods ADD COLUMN mod_db_asset_id INTEGER")
     if "canonical_id" not in columns:
         sync_conn.exec_driver_sql("ALTER TABLE mods ADD COLUMN canonical_id VARCHAR(180)")
+    if "tags_json" not in columns:
+        sync_conn.exec_driver_sql("ALTER TABLE mods ADD COLUMN tags_json TEXT NOT NULL DEFAULT '[]'")
     dep_columns = {row[1] for row in sync_conn.exec_driver_sql("PRAGMA table_info(dependencies)").fetchall()}
     if "target_url" not in dep_columns:
         sync_conn.exec_driver_sql("ALTER TABLE dependencies ADD COLUMN target_url TEXT")
